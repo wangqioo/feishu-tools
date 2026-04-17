@@ -245,17 +245,23 @@ class DataCache:
         c = self.conn.cursor()
         # 数据源配置表
         c.execute("""CREATE TABLE IF NOT EXISTS sources (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            token       TEXT NOT NULL,
-            sheet_id    TEXT NOT NULL,
-            sheet_title TEXT,
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            token        TEXT NOT NULL,
+            sheet_id     TEXT NOT NULL,
+            sheet_title  TEXT,
             use_open_api INTEGER DEFAULT 0,
-            row_count   INTEGER DEFAULT 0,
-            col_count   INTEGER DEFAULT 0,
-            synced_at   TEXT,
+            row_count    INTEGER DEFAULT 0,
+            col_count    INTEGER DEFAULT 0,
+            synced_at    TEXT,
+            source_type  TEXT DEFAULT 'online',
             UNIQUE(token, sheet_id)
         )""")
+        # 兼容旧数据库：若没有 source_type 列则补充
+        try:
+            c.execute("ALTER TABLE sources ADD COLUMN source_type TEXT DEFAULT 'online'")
+        except sqlite3.OperationalError:
+            pass  # 列已存在，忽略
         # 通用数据行表（按 source_id 分区）
         c.execute("""CREATE TABLE IF NOT EXISTS sheet_rows (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -277,19 +283,20 @@ class DataCache:
     # ── 数据源管理 ────────────────────────────────────────────────────────────
 
     def add_source(self, name: str, token: str, sheet_id: str,
-                   sheet_title: str = "", use_open_api: bool = False) -> int:
+                   sheet_title: str = "", use_open_api: bool = False,
+                   source_type: str = "online") -> int:
         c = self.conn.cursor()
         c.execute("""INSERT OR REPLACE INTO sources
-                     (name, token, sheet_id, sheet_title, use_open_api)
-                     VALUES (?,?,?,?,?)""",
-                  (name, token, sheet_id, sheet_title, int(use_open_api)))
+                     (name, token, sheet_id, sheet_title, use_open_api, source_type)
+                     VALUES (?,?,?,?,?,?)""",
+                  (name, token, sheet_id, sheet_title, int(use_open_api), source_type))
         self.conn.commit()
         return c.lastrowid
 
     def list_sources(self) -> list[dict]:
         c = self.conn.cursor()
         c.execute("SELECT id,name,token,sheet_id,sheet_title,use_open_api,"
-                  "row_count,col_count,synced_at FROM sources ORDER BY id")
+                  "row_count,col_count,synced_at,source_type FROM sources ORDER BY id")
         cols = [d[0] for d in c.description]
         return [dict(zip(cols, row)) for row in c.fetchall()]
 
@@ -302,7 +309,8 @@ class DataCache:
     def get_source(self, source_id: int) -> dict | None:
         c = self.conn.cursor()
         c.execute("SELECT id,name,token,sheet_id,sheet_title,use_open_api,"
-                  "row_count,col_count,synced_at FROM sources WHERE id=?", (source_id,))
+                  "row_count,col_count,synced_at,source_type FROM sources WHERE id=?",
+                  (source_id,))
         row = c.fetchone()
         if not row:
             return None
@@ -669,6 +677,144 @@ class ExcelExporter:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 本地文件读取器
+# ═════════════════════════════════════════════════════════════════════════════
+
+class LocalFileReader:
+    """读取本地 xlsx / xls / csv 文件，返回二维字符串列表"""
+
+    SUPPORTED = {
+        ".xlsx": "Excel 2007+",
+        ".xls":  "Excel 97-2003",
+        ".csv":  "CSV 文本",
+        ".tsv":  "TSV 文本",
+    }
+
+    @classmethod
+    def can_read(cls, path: str) -> bool:
+        return Path(path).suffix.lower() in cls.SUPPORTED
+
+    @classmethod
+    def read(cls, path: str, sheet_name: str = None) -> list[list[str]]:
+        """
+        返回二维字符串列表，第 0 行为表头。
+        sheet_name: xlsx 时指定工作表名称，None 则取第一个工作表。
+        """
+        suffix = Path(path).suffix.lower()
+        if suffix in (".xlsx", ".xls"):
+            return cls._read_excel(path, sheet_name)
+        elif suffix in (".csv", ".tsv"):
+            return cls._read_csv(path, suffix)
+        else:
+            raise ValueError(f"不支持的文件格式: {suffix}")
+
+    @classmethod
+    def _read_excel(cls, path: str, sheet_name: str = None) -> list[list[str]]:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        if sheet_name and sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+        else:
+            ws = wb.active
+        rows = []
+        for row in ws.iter_rows(values_only=True):
+            rows.append([("" if v is None else str(v)) for v in row])
+        wb.close()
+        # 去掉尾部全空行
+        while rows and all(v == "" for v in rows[-1]):
+            rows.pop()
+        return rows
+
+    @classmethod
+    def _read_csv(cls, path: str, suffix: str) -> list[list[str]]:
+        import csv
+        delimiter = "\t" if suffix == ".tsv" else ","
+        # 自动探测编码
+        encodings = ["utf-8-sig", "gbk", "utf-8", "latin-1"]
+        for enc in encodings:
+            try:
+                with open(path, "r", encoding=enc, newline="") as f:
+                    reader = csv.reader(f, delimiter=delimiter)
+                    rows = [list(row) for row in reader]
+                while rows and all(v == "" for v in rows[-1]):
+                    rows.pop()
+                return rows
+            except (UnicodeDecodeError, Exception):
+                continue
+        raise ValueError(f"无法解析文件编码: {path}")
+
+    @classmethod
+    def list_sheets(cls, path: str) -> list[str]:
+        """列出 xlsx 文件的所有工作表名称"""
+        suffix = Path(path).suffix.lower()
+        if suffix not in (".xlsx", ".xls"):
+            return []
+        wb = openpyxl.load_workbook(path, read_only=True)
+        names = list(wb.sheetnames)
+        wb.close()
+        return names
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# API 错误友好提示
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _format_api_error(exc: Exception) -> tuple[str, str]:
+    """
+    将 API 异常转为 (title, detail) 用于 messagebox 展示。
+    对 401/403 给出明确的权限指引。
+    """
+    import requests as _req
+
+    msg = str(exc)
+
+    # HTTP 状态码识别
+    status = None
+    if isinstance(exc, _req.HTTPError) and exc.response is not None:
+        status = exc.response.status_code
+        # 尝试解析响应体
+        try:
+            body = exc.response.json()
+            code = body.get("code") or body.get("error_code") or ""
+            server_msg = (body.get("msg") or body.get("message")
+                          or body.get("error") or "")
+            msg = f"[{code}] {server_msg}" if code else server_msg or msg
+        except Exception:
+            pass
+
+    if status in (401, 403) or "401" in msg or "403" in msg or \
+       "permission" in msg.lower() or "无权限" in msg or \
+       "access denied" in msg.lower() or "not authorized" in msg.lower():
+        title  = "权限不足，无法访问该飞书表格"
+        detail = (
+            f"错误信息: {msg}\n\n"
+            "可能原因：\n"
+            "  1. 当前账号没有该飞书表格的查看权限\n"
+            "     → 请联系表格所有者，将你的账号添加为「可查看」\n\n"
+            "  2. userId / App ID 填写有误\n"
+            "     → 检查 API 设置页面的 userId 是否是你的工号\n\n"
+            "  3. Access Token 已过期（使用官方 Open API 时）\n"
+            "     → 重新生成 user_access_token 并填写到 API 设置页\n\n"
+            "  4. 表格所在空间设置了组织外限制\n"
+            "     → 联系空间管理员开放访问权限"
+        )
+        return title, detail
+
+    if isinstance(exc, (_req.ConnectionError, _req.Timeout)):
+        title  = "网络连接失败"
+        detail = (
+            f"错误信息: {msg}\n\n"
+            "可能原因：\n"
+            "  1. 当前不在公司内网，无法访问内网代理\n"
+            "     → 连接 VPN 后重试，或切换至「飞书开放平台 API」模式\n\n"
+            "  2. 代理地址配置错误\n"
+            "     → 检查 API 设置中的「内网代理地址」"
+        )
+        return title, detail
+
+    return "数据拉取失败", f"错误信息:\n{msg}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # GUI 组件 — 通用工具
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -740,19 +886,27 @@ class DataSourcePanel(tk.Frame):
         list_card = make_card(self)
         list_card.pack(fill="both", expand=True, padx=16, pady=6)
 
-        cols = ("id", "name", "token", "sheet_title", "row_count", "col_count", "synced_at")
+        cols = ("id", "type", "name", "source", "sheet_title",
+                "row_count", "col_count", "synced_at")
         self.tree = ttk.Treeview(list_card, columns=cols, show="headings",
                                  selectmode="extended", height=12)
 
-        hdrs = {"id": (40, "ID"), "name": (150, "名称"),
-                "token": (220, "Token"),
-                "sheet_title": (140, "工作表"),
-                "row_count": (70, "行数"),
-                "col_count": (70, "列数"),
-                "synced_at": (150, "同步时间")}
+        hdrs = {
+            "id":          (40,  "ID"),
+            "type":        (70,  "类型"),
+            "name":        (150, "名称"),
+            "source":      (200, "Token / 文件路径"),
+            "sheet_title": (130, "工作表"),
+            "row_count":   (60,  "行数"),
+            "col_count":   (60,  "列数"),
+            "synced_at":   (150, "同步时间"),
+        }
         for col, (w, h) in hdrs.items():
             self.tree.heading(col, text=h)
             self.tree.column(col, width=w, minwidth=40)
+
+        self.tree.tag_configure("online", foreground=COLORS["primary"])
+        self.tree.tag_configure("local",  foreground=COLORS["success"])
 
         vsb = ttk.Scrollbar(list_card, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(list_card, orient="horizontal", command=self.tree.xview)
@@ -795,13 +949,25 @@ class DataSourcePanel(tk.Frame):
         for item in self.tree.get_children():
             self.tree.delete(item)
         for src in self.cache.list_sources():
-            self.tree.insert("", "end", iid=str(src["id"]), values=(
-                src["id"], src["name"], src["token"],
-                src["sheet_title"] or "-",
-                src["row_count"] or "-",
-                src["col_count"] or "-",
-                src["synced_at"] or "未同步",
-            ))
+            stype = src.get("source_type") or "online"
+            type_label = "本地文件" if stype == "local" else "飞书在线"
+            # 本地文件显示文件名，在线显示 token
+            if stype == "local":
+                source_display = Path(src["token"]).name
+            else:
+                source_display = src["token"]
+            self.tree.insert("", "end", iid=str(src["id"]),
+                             tags=(stype,),
+                             values=(
+                                 src["id"],
+                                 type_label,
+                                 src["name"],
+                                 source_display,
+                                 src["sheet_title"] or "-",
+                                 src["row_count"] or "-",
+                                 src["col_count"] or "-",
+                                 src["synced_at"] or "未同步",
+                             ))
 
     # ── 预览数据源 ────────────────────────────────────────────────────────────
 
@@ -848,127 +1014,242 @@ class DataSourcePanel(tk.Frame):
 
     def _open_add_dialog(self):
         dlg = tk.Toplevel(self)
-        dlg.title("添加飞书数据源")
-        dlg.geometry("560x560")
+        dlg.title("添加数据源")
+        dlg.geometry("600x640")
         dlg.resizable(False, False)
         dlg.grab_set()
         dlg.configure(bg=COLORS["bg"])
 
-        tk.Label(dlg, text="添加飞书表格数据源", bg=COLORS["bg"],
-                 fg=COLORS["text"], font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(16, 4))
-        tk.Label(dlg, text="填写飞书表格信息，系统将拉取该 Sheet 所有数据", bg=COLORS["bg"],
-                 fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 9)).pack(pady=(0, 12))
+        tk.Label(dlg, text="添加数据源", bg=COLORS["bg"],
+                 fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(14, 2))
+        tk.Label(dlg, text="支持在线飞书表格 和 本地 Excel/CSV 文件", bg=COLORS["bg"],
+                 fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 9)).pack(pady=(0, 8))
 
-        form = make_card(dlg)
-        form.pack(fill="x", padx=20, pady=4)
+        # ── 模式切换按钮（仿 Tab） ────────────────────────────────────────────
+        mode_var = tk.StringVar(value="online")
+        mode_bar = tk.Frame(dlg, bg=COLORS["bg"])
+        mode_bar.pack(fill="x", padx=20, pady=(0, 4))
 
-        fields = [
-            ("数据源名称 *", "name",    "给这个数据源起个名字，如「物料库2024」"),
-            ("表格 Token *", "token",   "飞书表格 URL 中的 token 参数"),
-            ("工作表 ID",    "sheet_id","留空则自动列出所有工作表"),
-            ("工作表名称",   "sheet_title", "可选，便于识别"),
+        online_btn = make_label_btn(mode_bar, "飞书在线表格",
+                                    lambda: _switch_mode("online"),
+                                    bg=COLORS["primary"])
+        local_btn  = make_label_btn(mode_bar, "本地文件 (Excel/CSV)",
+                                    lambda: _switch_mode("local"),
+                                    bg=COLORS["border"], fg=COLORS["text"])
+        online_btn.pack(side="left", padx=(0, 4))
+        local_btn.pack(side="left")
+
+        # 两个内容面板
+        online_frame = make_card(dlg)
+        local_frame  = make_card(dlg)
+        for f in (online_frame, local_frame):
+            f.pack(fill="x", padx=20, pady=4)
+        local_frame.pack_forget()
+
+        def _switch_mode(m: str):
+            mode_var.set(m)
+            if m == "online":
+                online_frame.pack(fill="x", padx=20, pady=4, before=log_card)
+                local_frame.pack_forget()
+                online_btn.config(bg=COLORS["primary"], fg="white")
+                local_btn.config(bg=COLORS["border"], fg=COLORS["text"])
+            else:
+                local_frame.pack(fill="x", padx=20, pady=4, before=log_card)
+                online_frame.pack_forget()
+                local_btn.config(bg=COLORS["success"], fg="white")
+                online_btn.config(bg=COLORS["border"], fg=COLORS["text"])
+
+        # ── 在线飞书表格参数 ──────────────────────────────────────────────────
+        ol = {}  # online vars
+        ol_fields = [
+            ("数据源名称 *", "name",       "给这个数据源起个名字，如「物料库2024」"),
+            ("表格 Token *", "token",      "飞书表格 URL 中的 token 参数"),
+            ("工作表 ID",    "sheet_id",   "留空后点「拉取工作表列表」自动填入"),
+            ("工作表名称",   "sheet_title","可选，便于识别"),
         ]
-
-        entries: dict[str, tk.StringVar] = {}
-        for row_i, (label, key, hint) in enumerate(fields):
-            tk.Label(form, text=label, bg=COLORS["card"], fg=COLORS["text"],
-                     font=("Microsoft YaHei UI", 9, "bold")).grid(
-                         row=row_i*2, column=0, padx=12, pady=(10, 0), sticky="w")
+        for ri, (label, key, hint) in enumerate(ol_fields):
+            tk.Label(online_frame, text=label, bg=COLORS["card"],
+                     fg=COLORS["text"],
+                     font=("Microsoft YaHei UI", 9, "bold"),
+                     width=14, anchor="e").grid(
+                         row=ri*2, column=0, padx=(12, 4), pady=(8, 0))
             var = tk.StringVar()
-            entries[key] = var
-            e = ttk.Entry(form, textvariable=var, width=48)
-            e.grid(row=row_i*2, column=1, padx=12, pady=(10, 0), sticky="ew")
-            tk.Label(form, text=hint, bg=COLORS["card"], fg=COLORS["text_sub"],
+            ol[key] = var
+            ttk.Entry(online_frame, textvariable=var, width=44).grid(
+                row=ri*2, column=1, padx=4, pady=(8, 0), sticky="ew")
+            tk.Label(online_frame, text=hint, bg=COLORS["card"],
+                     fg=COLORS["text_sub"],
                      font=("Microsoft YaHei UI", 7)).grid(
-                         row=row_i*2+1, column=1, padx=12, sticky="w")
-        form.columnconfigure(1, weight=1)
+                         row=ri*2+1, column=1, padx=4, sticky="w")
 
         # API 模式
-        api_frame = make_card(dlg)
-        api_frame.pack(fill="x", padx=20, pady=8)
         use_open = tk.BooleanVar(value=False)
-        tk.Label(api_frame, text="API 模式", bg=COLORS["card"], fg=COLORS["text"],
-                 font=("Microsoft YaHei UI", 9, "bold")).grid(
-                     row=0, column=0, padx=12, pady=8, sticky="w")
-        ttk.Radiobutton(api_frame, text="内网代理 (默认)", variable=use_open,
-                        value=False).grid(row=0, column=1, padx=8)
-        ttk.Radiobutton(api_frame, text="飞书开放平台 API", variable=use_open,
-                        value=True).grid(row=0, column=2, padx=8)
+        api_row = tk.Frame(online_frame, bg=COLORS["card"])
+        api_row.grid(row=len(ol_fields)*2, column=0, columnspan=2,
+                     padx=12, pady=(6, 0), sticky="w")
+        tk.Label(api_row, text="API 模式:", bg=COLORS["card"],
+                 fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(api_row, text="内网代理 (默认)",
+                        variable=use_open, value=False).pack(side="left", padx=4)
+        ttk.Radiobutton(api_row, text="飞书开放平台 API",
+                        variable=use_open, value=True).pack(side="left", padx=4)
 
-        # 如果选了开放平台，显示 access_token 输入
-        at_frame = tk.Frame(api_frame, bg=COLORS["card"])
-        at_frame.grid(row=1, column=0, columnspan=3, padx=12, pady=(0, 8), sticky="ew")
-        tk.Label(at_frame, text="Access Token", bg=COLORS["card"],
-                 fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 8)).pack(side="left")
-        at_var = tk.StringVar()
-        ttk.Entry(at_frame, textvariable=at_var, width=40, show="*").pack(side="left", padx=8)
-        entries["access_token"] = at_var
+        at_row = tk.Frame(online_frame, bg=COLORS["card"])
+        at_row.grid(row=len(ol_fields)*2+1, column=0, columnspan=2,
+                    padx=12, pady=(4, 8), sticky="w")
+        tk.Label(at_row, text="Access Token:", bg=COLORS["card"],
+                 fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 8)).pack(side="left")
+        ol["access_token"] = tk.StringVar()
+        ttk.Entry(at_row, textvariable=ol["access_token"],
+                  width=38, show="*").pack(side="left", padx=8)
 
-        # 行数范围
-        range_frame = make_card(dlg)
-        range_frame.pack(fill="x", padx=20, pady=4)
-        tk.Label(range_frame, text="最大拉取行数", bg=COLORS["card"], fg=COLORS["text"],
-                 font=("Microsoft YaHei UI", 9, "bold")).grid(
-                     row=0, column=0, padx=12, pady=8, sticky="w")
-        max_rows_var = tk.StringVar(value="5000")
-        ttk.Entry(range_frame, textvariable=max_rows_var, width=10).grid(
-            row=0, column=1, padx=8)
-        tk.Label(range_frame, text="行（含表头）", bg=COLORS["card"],
-                 fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 8)).grid(
-                     row=0, column=2, sticky="w")
-        entries["max_rows"] = max_rows_var
+        ol["max_rows"] = tk.StringVar(value="5000")
+        mr_row = tk.Frame(online_frame, bg=COLORS["card"])
+        mr_row.grid(row=len(ol_fields)*2+2, column=0, columnspan=2,
+                    padx=12, pady=(0, 8), sticky="w")
+        tk.Label(mr_row, text="最大拉取行数:",
+                 bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
+        ttk.Entry(mr_row, textvariable=ol["max_rows"], width=8).pack(
+            side="left", padx=8)
+        tk.Label(mr_row, text="行（含表头）",
+                 bg=COLORS["card"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 8)).pack(side="left")
+        online_frame.columnconfigure(1, weight=1)
 
-        # 状态日志
+        # ── 本地文件参数 ──────────────────────────────────────────────────────
+        lc = {}
+        tk.Label(local_frame, text="数据源名称 *",
+                 bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=0, column=0, padx=(12, 4), pady=(10, 0))
+        lc["name"] = tk.StringVar()
+        ttk.Entry(local_frame, textvariable=lc["name"], width=42).grid(
+            row=0, column=1, padx=4, pady=(10, 0), sticky="ew")
+
+        tk.Label(local_frame, text="文件路径 *",
+                 bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=1, column=0, padx=(12, 4), pady=(8, 0))
+        lc["filepath"] = tk.StringVar()
+        path_row = tk.Frame(local_frame, bg=COLORS["card"])
+        path_row.grid(row=1, column=1, padx=4, pady=(8, 0), sticky="ew")
+        path_entry = ttk.Entry(path_row, textvariable=lc["filepath"], width=34)
+        path_entry.pack(side="left")
+
+        def _browse_file():
+            fp = filedialog.askopenfilename(
+                title="选择文件",
+                filetypes=[
+                    ("Excel 文件", "*.xlsx *.xls"),
+                    ("CSV 文件", "*.csv *.tsv"),
+                    ("所有支持的格式", "*.xlsx *.xls *.csv *.tsv"),
+                ],
+                parent=dlg,
+            )
+            if fp:
+                lc["filepath"].set(fp)
+                # 自动填充名称（如果还没填）
+                if not lc["name"].get():
+                    lc["name"].set(Path(fp).stem)
+                # 如果是 xlsx，刷新工作表列表
+                _refresh_sheets(fp)
+
+        make_label_btn(path_row, "浏览...", _browse_file,
+                       bg=COLORS["text_sub"], padx=8, pady=2,
+                       font_size=8).pack(side="left", padx=6)
+
+        tk.Label(local_frame, text="工作表",
+                 bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=2, column=0, padx=(12, 4), pady=(8, 0))
+        lc["sheet"] = tk.StringVar()
+        lc["sheet_cb"] = ttk.Combobox(local_frame, textvariable=lc["sheet"],
+                                       width=30, state="readonly")
+        lc["sheet_cb"].grid(row=2, column=1, padx=4, pady=(8, 0), sticky="w")
+        tk.Label(local_frame, text="CSV/TSV 文件只有一个工作表，无需选择",
+                 bg=COLORS["card"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 7)).grid(
+                     row=3, column=1, padx=4, sticky="w", pady=(0, 8))
+        local_frame.columnconfigure(1, weight=1)
+
+        def _refresh_sheets(fp: str):
+            sheets = LocalFileReader.list_sheets(fp)
+            lc["sheet_cb"]["values"] = sheets
+            if sheets:
+                lc["sheet"].set(sheets[0])
+            else:
+                lc["sheet"].set("")
+
+        lc["filepath"].trace_add("write", lambda *_: (
+            _refresh_sheets(lc["filepath"].get())
+            if lc["filepath"].get() else None
+        ))
+
+        # ── 状态日志 ─────────────────────────────────────────────────────────
+        log_card = tk.Frame(dlg, bg=COLORS["bg"])
+        log_card.pack(fill="x", padx=20, pady=4)
         log_var = tk.StringVar(value="等待操作...")
-        tk.Label(dlg, textvariable=log_var, bg=COLORS["bg"], fg=COLORS["text_sub"],
-                 font=("Microsoft YaHei UI", 8), wraplength=500).pack(pady=4)
+        tk.Label(log_card, textvariable=log_var, bg=COLORS["bg"],
+                 fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 8), wraplength=540).pack(anchor="w")
 
-        # 按钮
+        # ── 按钮 ─────────────────────────────────────────────────────────────
         btn_row = tk.Frame(dlg, bg=COLORS["bg"])
-        btn_row.pack(pady=12)
+        btn_row.pack(pady=10)
 
         def do_fetch_sheets():
-            token = entries["token"].get().strip()
+            token = ol["token"].get().strip()
             if not token:
                 messagebox.showwarning("提示", "请填写表格 Token", parent=dlg)
                 return
             log_var.set("正在拉取工作表列表...")
-            self.api.access_token = entries.get("access_token", tk.StringVar()).get()
+            dlg.update_idletasks()
+            self.api.access_token = ol["access_token"].get()
             try:
                 sheets = self.api.fetch_meta(token, use_open_api=use_open.get())
                 if not sheets:
-                    log_var.set("未找到工作表，请检查 Token")
+                    log_var.set("未找到工作表，请检查 Token 或权限")
                     return
-                entries["sheet_id"].set(sheets[0]["sheet_id"])
-                entries["sheet_title"].set(sheets[0]["sheet_title"])
-                log_var.set(f"发现 {len(sheets)} 个工作表，已自动填入第一个")
+                ol["sheet_id"].set(sheets[0]["sheet_id"])
+                ol["sheet_title"].set(sheets[0]["sheet_title"])
+                log_var.set(
+                    f"发现 {len(sheets)} 个工作表，已填入第一个: "
+                    f"{sheets[0]['sheet_title']}")
             except Exception as ex:
-                log_var.set(f"拉取失败: {ex}")
+                title, detail = _format_api_error(ex)
+                log_var.set(f"失败: {title}")
+                messagebox.showerror(title, detail, parent=dlg)
 
-        def do_add():
-            name  = entries["name"].get().strip()
-            token = entries["token"].get().strip()
-            sid   = entries["sheet_id"].get().strip()
-            title = entries["sheet_title"].get().strip()
+        def do_add_online():
+            name  = ol["name"].get().strip()
+            token = ol["token"].get().strip()
+            sid   = ol["sheet_id"].get().strip()
+            title = ol["sheet_title"].get().strip()
             if not name or not token or not sid:
                 messagebox.showwarning("提示", "名称、Token、工作表 ID 为必填项", parent=dlg)
                 return
             try:
-                max_r = int(entries["max_rows"].get().strip() or "5000")
+                max_r = int(ol["max_rows"].get().strip() or "5000")
             except ValueError:
                 max_r = 5000
-
             log_var.set("正在拉取数据...")
             dlg.update_idletasks()
 
             def worker():
                 try:
-                    self.api.access_token = entries.get("access_token", tk.StringVar()).get()
+                    self.api.access_token = ol["access_token"].get()
                     rows = self.api.fetch_values(token, sid,
                                                  use_open_api=use_open.get(),
                                                  max_rows=max_r)
                     src_id = self.cache.add_source(
-                        name, token, sid, title, use_open.get()
+                        name, token, sid, title,
+                        use_open_api=use_open.get(),
+                        source_type="online",
                     )
                     self.cache.store_rows(src_id, rows)
                     dlg.after(0, lambda: log_var.set(
@@ -978,15 +1259,80 @@ class DataSourcePanel(tk.Frame):
                         self.on_change and self.on_change(),
                     ])
                 except Exception as ex:
-                    dlg.after(0, lambda: log_var.set(f"失败: {ex}"))
+                    err_title, err_detail = _format_api_error(ex)
+                    dlg.after(0, lambda: log_var.set(f"失败: {err_title}"))
+                    dlg.after(0, lambda: messagebox.showerror(
+                        err_title, err_detail, parent=dlg))
 
             threading.Thread(target=worker, daemon=True).start()
 
-        make_label_btn(btn_row, "🔍 拉取工作表列表", do_fetch_sheets,
-                       bg=COLORS["warning"]).pack(side="left", padx=6)
-        make_label_btn(btn_row, "✓ 添加并同步", do_add).pack(side="left", padx=6)
+        def do_add_local():
+            name = lc["name"].get().strip()
+            fp   = lc["filepath"].get().strip()
+            if not name or not fp:
+                messagebox.showwarning("提示", "名称和文件路径为必填项", parent=dlg)
+                return
+            if not Path(fp).exists():
+                messagebox.showerror("错误", f"文件不存在:\n{fp}", parent=dlg)
+                return
+            if not LocalFileReader.can_read(fp):
+                messagebox.showerror("错误",
+                                     f"不支持的文件格式: {Path(fp).suffix}\n"
+                                     f"支持: {', '.join(LocalFileReader.SUPPORTED)}",
+                                     parent=dlg)
+                return
+            sheet = lc["sheet"].get().strip() or None
+            log_var.set("正在读取文件...")
+            dlg.update_idletasks()
+
+            def worker():
+                try:
+                    rows = LocalFileReader.read(fp, sheet_name=sheet)
+                    title = sheet or Path(fp).stem
+                    src_id = self.cache.add_source(
+                        name,
+                        token=fp,           # 用文件路径当 token
+                        sheet_id=sheet or "sheet1",
+                        sheet_title=title,
+                        use_open_api=False,
+                        source_type="local",
+                    )
+                    self.cache.store_rows(src_id, rows)
+                    dlg.after(0, lambda: log_var.set(
+                        f"完成！共读取 {len(rows)} 行数据"))
+                    dlg.after(100, lambda: [
+                        self.refresh_table(),
+                        self.on_change and self.on_change(),
+                    ])
+                except Exception as ex:
+                    dlg.after(0, lambda e=ex: [
+                        log_var.set(f"读取失败: {e}"),
+                        messagebox.showerror("读取失败", str(e), parent=dlg),
+                    ])
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def do_add():
+            if mode_var.get() == "online":
+                do_add_online()
+            else:
+                do_add_local()
+
+        self._fetch_btn = make_label_btn(btn_row, "拉取工作表列表", do_fetch_sheets,
+                                          bg=COLORS["warning"])
+        self._fetch_btn.pack(side="left", padx=4)
+        make_label_btn(btn_row, "添加并导入", do_add).pack(side="left", padx=4)
         make_label_btn(btn_row, "取消", dlg.destroy,
-                       bg=COLORS["text_sub"]).pack(side="left", padx=6)
+                       bg=COLORS["text_sub"]).pack(side="left", padx=4)
+
+        def _update_buttons(*_):
+            """在线模式显示「拉取工作表列表」，本地模式隐藏"""
+            if mode_var.get() == "online":
+                self._fetch_btn.pack(side="left", padx=4, before=btn_row.winfo_children()[1])
+            else:
+                self._fetch_btn.pack_forget()
+
+        mode_var.trace_add("write", _update_buttons)
 
     # ── 同步 ─────────────────────────────────────────────────────────────────
 
@@ -1000,20 +1346,41 @@ class DataSourcePanel(tk.Frame):
             if not src:
                 continue
 
-            def worker(s=src):
-                try:
-                    rows = self.api.fetch_values(
-                        s["token"], s["sheet_id"],
-                        use_open_api=bool(s["use_open_api"])
-                    )
-                    self.cache.store_rows(s["id"], rows)
-                    self.after(0, self.refresh_table)
-                    self.after(0, lambda: self.on_change and self.on_change())
-                except Exception as ex:
-                    self.after(0, lambda e=ex: messagebox.showerror(
-                        "同步失败", str(e), parent=self))
+            stype = src.get("source_type") or "online"
 
-            threading.Thread(target=worker, daemon=True).start()
+            if stype == "local":
+                # 本地文件：重新从磁盘读取
+                def local_worker(s=src):
+                    fp    = s["token"]   # 存文件路径
+                    sheet = s["sheet_id"] if s["sheet_id"] != "sheet1" else None
+                    try:
+                        if not Path(fp).exists():
+                            raise FileNotFoundError(
+                                f"文件已不存在，请重新添加数据源:\n{fp}")
+                        rows = LocalFileReader.read(fp, sheet_name=sheet)
+                        self.cache.store_rows(s["id"], rows)
+                        self.after(0, self.refresh_table)
+                        self.after(0, lambda: self.on_change and self.on_change())
+                    except Exception as ex:
+                        self.after(0, lambda e=ex: messagebox.showerror(
+                            "本地文件重新读取失败", str(e), parent=self))
+                threading.Thread(target=local_worker, daemon=True).start()
+            else:
+                # 在线飞书：通过 API 拉取，详细处理权限错误
+                def online_worker(s=src):
+                    try:
+                        rows = self.api.fetch_values(
+                            s["token"], s["sheet_id"],
+                            use_open_api=bool(s["use_open_api"])
+                        )
+                        self.cache.store_rows(s["id"], rows)
+                        self.after(0, self.refresh_table)
+                        self.after(0, lambda: self.on_change and self.on_change())
+                    except Exception as ex:
+                        err_title, err_detail = _format_api_error(ex)
+                        self.after(0, lambda t=err_title, d=err_detail: messagebox.showerror(
+                            t, d, parent=self))
+                threading.Thread(target=online_worker, daemon=True).start()
 
     # ── 删除 ─────────────────────────────────────────────────────────────────
 
