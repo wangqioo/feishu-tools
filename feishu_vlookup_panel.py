@@ -1,0 +1,2041 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+飞书表格函数面板 v1.0
+跨飞书表格的可视化函数操作工具
+支持 VLOOKUP / XLOOKUP / INDEX-MATCH / SUMIF / COUNTIF / SUMIFS
+"""
+
+# ─── 依赖自动安装 ─────────────────────────────────────────────────────────────
+import subprocess, sys, importlib
+
+_DEPS = ["requests", "openpyxl"]
+
+def _ensure_deps():
+    for pkg in _DEPS:
+        try:
+            importlib.import_module(pkg)
+        except ImportError:
+            print(f"正在安装依赖: {pkg} ...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+
+_ensure_deps()
+
+# ─── 标准库 ───────────────────────────────────────────────────────────────────
+import os, json, sqlite3, re, threading, time, copy
+from datetime import datetime
+from pathlib import Path
+
+# ─── 第三方库 ─────────────────────────────────────────────────────────────────
+import requests
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+
+# ─── Tkinter ─────────────────────────────────────────────────────────────────
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, scrolledtext
+
+# ─── 常量 ─────────────────────────────────────────────────────────────────────
+APP_NAME    = "飞书表格函数面板"
+APP_VERSION = "1.0.0"
+DATA_DIR    = Path("feishu_vlookup_data")
+CONFIG_FILE = DATA_DIR / "config.json"
+CACHE_DB    = DATA_DIR / "cache.db"
+
+FUNCTION_DEFS = {
+    "VLOOKUP":    "垂直查找  在查找列搜索关键字，返回同行指定列的值",
+    "XLOOKUP":    "扩展查找  支持返回多列结果，可指定未找到时的默认值",
+    "INDEX/MATCH":"索引匹配  最灵活的查找，支持横向/纵向/精确/模糊",
+    "SUMIF":      "条件求和  统计满足条件的行对应列的数值之和",
+    "COUNTIF":    "条件计数  统计满足条件的行数",
+    "SUMIFS":     "多条件求和  同时满足多个条件时对数值列求和",
+}
+
+MATCH_MODES = [
+    ("exact",      "精确匹配"),
+    ("contains",   "包含匹配"),
+    ("startswith", "前缀匹配"),
+    ("endswith",   "后缀匹配"),
+    ("regex",      "正则匹配"),
+]
+
+# ─── 颜色主题 ─────────────────────────────────────────────────────────────────
+COLORS = {
+    "bg":           "#F5F7FA",
+    "card":         "#FFFFFF",
+    "primary":      "#1664FF",
+    "primary_dark": "#0D4FCC",
+    "success":      "#00B578",
+    "warning":      "#FF9F0A",
+    "error":        "#FF3B30",
+    "text":         "#1D2129",
+    "text_sub":     "#86909C",
+    "border":       "#E5E6EB",
+    "row_even":     "#F7F8FA",
+    "row_odd":      "#FFFFFF",
+    "highlight":    "#E8F0FE",
+    "tag_vlookup":  "#E8F4FD",
+    "tag_sumif":    "#FFF7E6",
+    "tag_index":    "#F0FFF4",
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# API 层
+# ═════════════════════════════════════════════════════════════════════════════
+
+class FeishuAPIClient:
+    """飞书表格数据接口（兼容企业内网代理和官方 API）"""
+
+    DEFAULT_PROXY = "https://mcenter.huaqin.com"
+
+    def __init__(self, base_url: str = None, app_id: str = None, user_id: str = None,
+                 access_token: str = None):
+        self.base_url     = (base_url or self.DEFAULT_PROXY).rstrip("/")
+        self.app_id       = app_id    or "cli_a96ac38049f8d0e5"
+        self.user_id      = user_id   or ""
+        self.access_token = access_token or ""
+
+    # ── 内网代理模式 ──────────────────────────────────────────────────────────
+
+    def _proxy_headers(self) -> dict:
+        return {
+            "Content-Type": "application/json",
+            "Origin":       self.app_id,
+            "userId":       self.user_id,
+        }
+
+    def get_sheet_meta_proxy(self, token: str) -> dict:
+        url  = f"{self.base_url}/fs/sheet/v1/spreadsheetsMetainfo"
+        body = {"spreadsheetToken": token}
+        r = requests.post(url, json=body, headers=self._proxy_headers(), timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def get_sheet_values_proxy(self, token: str, sheet_id: str,
+                               start_row: int = 1, end_row: int = 2000) -> dict:
+        url  = f"{self.base_url}/fs/sheet/v1/getSheetsValue"
+        body = {
+            "spreadsheetToken": token,
+            "sheetId":          sheet_id,
+            "startRow":         start_row,
+            "endRow":           end_row,
+        }
+        r = requests.post(url, json=body, headers=self._proxy_headers(), timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    # ── 官方 Open API 模式 ────────────────────────────────────────────────────
+
+    def _open_headers(self) -> dict:
+        return {
+            "Content-Type":  "application/json; charset=utf-8",
+            "Authorization": f"Bearer {self.access_token}",
+        }
+
+    def get_sheet_meta_open(self, token: str) -> dict:
+        url = f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{token}/sheets/query"
+        r = requests.get(url, headers=self._open_headers(), timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def get_sheet_values_open(self, token: str, sheet_id: str,
+                              range_str: str = None) -> dict:
+        rng = range_str or f"{sheet_id}!A1:ZZ5000"
+        url = (f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets"
+               f"/{token}/values/{rng}")
+        r = requests.get(url, headers=self._open_headers(), timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    # ── 统一调用（根据配置自动选择） ──────────────────────────────────────────
+
+    def fetch_meta(self, token: str, use_open_api: bool = False) -> list[dict]:
+        """返回 [{sheet_id, sheet_title}, ...]"""
+        if use_open_api:
+            data   = self.get_sheet_meta_open(token)
+            sheets = data.get("data", {}).get("sheets", [])
+            return [{"sheet_id": s["sheet_id"], "sheet_title": s["title"]} for s in sheets]
+        else:
+            data   = self.get_sheet_meta_proxy(token)
+            sheets = data.get("data", {}).get("sheets", [])
+            return [{"sheet_id": s.get("sheetId", ""), "sheet_title": s.get("title", "")}
+                    for s in sheets]
+
+    def fetch_values(self, token: str, sheet_id: str,
+                     use_open_api: bool = False,
+                     max_rows: int = 5000) -> list[list]:
+        """返回二维列表 rows[row][col]"""
+        if use_open_api:
+            data = self.get_sheet_values_open(token, sheet_id)
+            return data.get("data", {}).get("valueRange", {}).get("values", [])
+        else:
+            data = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows)
+            return data.get("data", {}).get("values", [])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 数据缓存层
+# ═════════════════════════════════════════════════════════════════════════════
+
+class DataCache:
+    """SQLite 本地缓存，存储各飞书 Sheet 的数据快照"""
+
+    def __init__(self, db_path: Path = CACHE_DB):
+        DATA_DIR.mkdir(exist_ok=True)
+        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._init_tables()
+
+    def _init_tables(self):
+        c = self.conn.cursor()
+        # 数据源配置表
+        c.execute("""CREATE TABLE IF NOT EXISTS sources (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            token       TEXT NOT NULL,
+            sheet_id    TEXT NOT NULL,
+            sheet_title TEXT,
+            use_open_api INTEGER DEFAULT 0,
+            row_count   INTEGER DEFAULT 0,
+            col_count   INTEGER DEFAULT 0,
+            synced_at   TEXT,
+            UNIQUE(token, sheet_id)
+        )""")
+        # 通用数据行表（按 source_id 分区）
+        c.execute("""CREATE TABLE IF NOT EXISTS sheet_rows (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL,
+            row_idx   INTEGER NOT NULL,
+            col_idx   INTEGER NOT NULL,
+            value     TEXT,
+            FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_rows_source ON sheet_rows(source_id, row_idx)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_rows_col    ON sheet_rows(source_id, col_idx, value)")
+        # API 配置
+        c.execute("""CREATE TABLE IF NOT EXISTS api_config (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )""")
+        self.conn.commit()
+
+    # ── 数据源管理 ────────────────────────────────────────────────────────────
+
+    def add_source(self, name: str, token: str, sheet_id: str,
+                   sheet_title: str = "", use_open_api: bool = False) -> int:
+        c = self.conn.cursor()
+        c.execute("""INSERT OR REPLACE INTO sources
+                     (name, token, sheet_id, sheet_title, use_open_api)
+                     VALUES (?,?,?,?,?)""",
+                  (name, token, sheet_id, sheet_title, int(use_open_api)))
+        self.conn.commit()
+        return c.lastrowid
+
+    def list_sources(self) -> list[dict]:
+        c = self.conn.cursor()
+        c.execute("SELECT id,name,token,sheet_id,sheet_title,use_open_api,"
+                  "row_count,col_count,synced_at FROM sources ORDER BY id")
+        cols = [d[0] for d in c.description]
+        return [dict(zip(cols, row)) for row in c.fetchall()]
+
+    def delete_source(self, source_id: int):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM sheet_rows WHERE source_id=?", (source_id,))
+        c.execute("DELETE FROM sources WHERE id=?", (source_id,))
+        self.conn.commit()
+
+    def get_source(self, source_id: int) -> dict | None:
+        c = self.conn.cursor()
+        c.execute("SELECT id,name,token,sheet_id,sheet_title,use_open_api,"
+                  "row_count,col_count,synced_at FROM sources WHERE id=?", (source_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in c.description]
+        return dict(zip(cols, row))
+
+    # ── 数据写入 / 读取 ───────────────────────────────────────────────────────
+
+    def store_rows(self, source_id: int, rows: list[list]):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM sheet_rows WHERE source_id=?", (source_id,))
+        batch = []
+        for ri, row in enumerate(rows):
+            for ci, val in enumerate(row):
+                if val is not None:
+                    batch.append((source_id, ri, ci, str(val)))
+        if batch:
+            c.executemany("INSERT INTO sheet_rows(source_id,row_idx,col_idx,value)"
+                          " VALUES(?,?,?,?)", batch)
+        row_count = len(rows)
+        col_count = max((len(r) for r in rows), default=0)
+        c.execute("UPDATE sources SET row_count=?,col_count=?,synced_at=? WHERE id=?",
+                  (row_count, col_count, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), source_id))
+        self.conn.commit()
+
+    def get_headers(self, source_id: int) -> list[str]:
+        """返回第 0 行（表头）"""
+        c = self.conn.cursor()
+        c.execute("SELECT col_idx, value FROM sheet_rows "
+                  "WHERE source_id=? AND row_idx=0 ORDER BY col_idx", (source_id,))
+        rows = c.fetchall()
+        if not rows:
+            return []
+        max_col = rows[-1][0]
+        headers = [""] * (max_col + 1)
+        for ci, val in rows:
+            headers[ci] = val or ""
+        return headers
+
+    def get_all_rows(self, source_id: int) -> list[list[str]]:
+        """返回所有行（含表头），每行是等长的字符串列表"""
+        src = self.get_source(source_id)
+        if not src:
+            return []
+        col_count = src["col_count"] or 1
+        c = self.conn.cursor()
+        c.execute("SELECT row_idx, col_idx, value FROM sheet_rows "
+                  "WHERE source_id=? ORDER BY row_idx, col_idx", (source_id,))
+        from collections import defaultdict
+        row_map: dict[int, dict[int, str]] = defaultdict(dict)
+        for ri, ci, val in c.fetchall():
+            row_map[ri][ci] = val or ""
+        if not row_map:
+            return []
+        max_row = max(row_map.keys())
+        result = []
+        for ri in range(max_row + 1):
+            row = [row_map[ri].get(ci, "") for ci in range(col_count)]
+            result.append(row)
+        return result
+
+    def get_col_values(self, source_id: int, col_idx: int,
+                       skip_header: bool = True) -> list[str]:
+        c = self.conn.cursor()
+        start = 1 if skip_header else 0
+        c.execute("SELECT value FROM sheet_rows WHERE source_id=? AND col_idx=?"
+                  " AND row_idx>=? ORDER BY row_idx", (source_id, col_idx, start))
+        return [r[0] or "" for r in c.fetchall()]
+
+    # ── API 配置 ──────────────────────────────────────────────────────────────
+
+    def save_api_config(self, cfg: dict):
+        c = self.conn.cursor()
+        for k, v in cfg.items():
+            c.execute("INSERT OR REPLACE INTO api_config(key,value) VALUES(?,?)", (k, str(v)))
+        self.conn.commit()
+
+    def load_api_config(self) -> dict:
+        c = self.conn.cursor()
+        c.execute("SELECT key,value FROM api_config")
+        return {k: v for k, v in c.fetchall()}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 公式引擎
+# ═════════════════════════════════════════════════════════════════════════════
+
+class FormulaEngine:
+    """在内存二维表上执行类 Excel 函数"""
+
+    @staticmethod
+    def _match_value(cell: str, keyword: str, mode: str) -> bool:
+        c, k = str(cell).strip(), str(keyword).strip()
+        if mode == "exact":
+            return c.upper() == k.upper()
+        if mode == "contains":
+            return k.upper() in c.upper()
+        if mode == "startswith":
+            return c.upper().startswith(k.upper())
+        if mode == "endswith":
+            return c.upper().endswith(k.upper())
+        if mode == "regex":
+            try:
+                return bool(re.search(k, c, re.IGNORECASE))
+            except re.error:
+                return False
+        return c.upper() == k.upper()
+
+    # ── VLOOKUP ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def vlookup(lookup_values: list[str],
+                lookup_table: list[list[str]],
+                key_col: int,
+                return_cols: list[int],
+                match_mode: str = "exact",
+                not_found: str = "#N/A") -> list[dict]:
+        """
+        lookup_values: 查找键列表
+        lookup_table:  来源表（list of rows，含表头）
+        key_col:       查找列索引（0-based，在 lookup_table 中）
+        return_cols:   要返回的列索引列表
+        """
+        # 构建索引加速精确匹配
+        index: dict[str, list[str]] = {}
+        for row in lookup_table[1:]:  # 跳过表头
+            if key_col < len(row):
+                k = str(row[key_col]).strip().upper()
+                if k not in index:
+                    index[k] = row
+
+        results = []
+        for lv in lookup_values:
+            lv_str = str(lv).strip()
+            found_row = None
+
+            if match_mode == "exact":
+                found_row = index.get(lv_str.upper())
+            else:
+                for row in lookup_table[1:]:
+                    if key_col < len(row):
+                        if FormulaEngine._match_value(row[key_col], lv_str, match_mode):
+                            found_row = row
+                            break
+
+            if found_row is not None:
+                returned = {
+                    f"col_{rc}": (found_row[rc] if rc < len(found_row) else "")
+                    for rc in return_cols
+                }
+                returned["__status__"] = "MATCH"
+            else:
+                returned = {f"col_{rc}": not_found for rc in return_cols}
+                returned["__status__"] = "NOT_FOUND"
+
+            returned["__lookup_value__"] = lv_str
+            results.append(returned)
+        return results
+
+    # ── XLOOKUP ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def xlookup(lookup_values: list[str],
+                search_table: list[list[str]],
+                search_col: int,
+                return_table: list[list[str]],
+                return_cols: list[int],
+                match_mode: str = "exact",
+                not_found: str = "#N/A") -> list[dict]:
+        """
+        支持 search_table 与 return_table 来自不同数据源（跨表查找）
+        """
+        # 建立行索引：search_table row_idx -> return_table row 映射
+        results = []
+        for lv in lookup_values:
+            lv_str = str(lv).strip()
+            found_ret_row = None
+
+            for ri, row in enumerate(search_table[1:], start=1):
+                if search_col < len(row):
+                    if FormulaEngine._match_value(row[search_col], lv_str, match_mode):
+                        if ri < len(return_table):
+                            found_ret_row = return_table[ri]
+                        break
+
+            if found_ret_row is not None:
+                returned = {
+                    f"col_{rc}": (found_ret_row[rc] if rc < len(found_ret_row) else "")
+                    for rc in return_cols
+                }
+                returned["__status__"] = "MATCH"
+            else:
+                returned = {f"col_{rc}": not_found for rc in return_cols}
+                returned["__status__"] = "NOT_FOUND"
+
+            returned["__lookup_value__"] = lv_str
+            results.append(returned)
+        return results
+
+    # ── INDEX/MATCH ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def index_match(lookup_values: list[str],
+                    match_table: list[list[str]],
+                    match_col: int,
+                    index_table: list[list[str]],
+                    index_col: int,
+                    match_mode: str = "exact",
+                    not_found: str = "#N/A") -> list[dict]:
+        """
+        MATCH 在 match_table 的 match_col 列找到行号，
+        INDEX 在 index_table 同行的 index_col 列取值
+        支持跨表
+        """
+        results = []
+        for lv in lookup_values:
+            lv_str = str(lv).strip()
+            matched_row_idx = None
+            for ri, row in enumerate(match_table[1:], start=1):
+                if match_col < len(row):
+                    if FormulaEngine._match_value(row[match_col], lv_str, match_mode):
+                        matched_row_idx = ri
+                        break
+
+            if matched_row_idx is not None and matched_row_idx < len(index_table):
+                ret_row = index_table[matched_row_idx]
+                val = ret_row[index_col] if index_col < len(ret_row) else ""
+                results.append({
+                    "__lookup_value__": lv_str,
+                    "__status__":       "MATCH",
+                    "result":           val,
+                    "_row_idx":         matched_row_idx,
+                })
+            else:
+                results.append({
+                    "__lookup_value__": lv_str,
+                    "__status__":       "NOT_FOUND",
+                    "result":           not_found,
+                    "_row_idx":         -1,
+                })
+        return results
+
+    # ── SUMIF ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def sumif(table: list[list[str]],
+              criteria_col: int,
+              criteria: str,
+              sum_col: int,
+              match_mode: str = "exact") -> dict:
+        total = 0.0
+        count = 0
+        matched_rows = []
+        for row in table[1:]:
+            if criteria_col < len(row):
+                if FormulaEngine._match_value(row[criteria_col], criteria, match_mode):
+                    raw = row[sum_col] if sum_col < len(row) else ""
+                    try:
+                        total += float(str(raw).replace(",", "").strip())
+                        count += 1
+                        matched_rows.append(row)
+                    except ValueError:
+                        pass
+        return {"sum": total, "count": count, "matched_rows": matched_rows}
+
+    # ── COUNTIF ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def countif(table: list[list[str]],
+                criteria_col: int,
+                criteria: str,
+                match_mode: str = "exact") -> dict:
+        count = 0
+        matched_rows = []
+        for row in table[1:]:
+            if criteria_col < len(row):
+                if FormulaEngine._match_value(row[criteria_col], criteria, match_mode):
+                    count += 1
+                    matched_rows.append(row)
+        return {"count": count, "matched_rows": matched_rows}
+
+    # ── SUMIFS（多条件） ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def sumifs(table: list[list[str]],
+               sum_col: int,
+               conditions: list[dict]) -> dict:
+        """
+        conditions: [{"col": int, "criteria": str, "mode": str}, ...]
+        """
+        total = 0.0
+        count = 0
+        matched_rows = []
+        for row in table[1:]:
+            all_match = all(
+                (cond["col"] < len(row) and
+                 FormulaEngine._match_value(row[cond["col"]], cond["criteria"], cond.get("mode", "exact")))
+                for cond in conditions
+            )
+            if all_match:
+                raw = row[sum_col] if sum_col < len(row) else ""
+                try:
+                    total += float(str(raw).replace(",", "").strip())
+                    count += 1
+                    matched_rows.append(row)
+                except ValueError:
+                    pass
+        return {"sum": total, "count": count, "matched_rows": matched_rows}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Excel 导出
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ExcelExporter:
+
+    HEADER_FILL  = PatternFill("solid", fgColor="1664FF")
+    HEADER_FONT  = Font(bold=True, color="FFFFFF", size=10)
+    MATCH_FILL   = PatternFill("solid", fgColor="E6F7F0")
+    NOMATCH_FILL = PatternFill("solid", fgColor="FFF1F0")
+    BORDER_SIDE  = Side(style="thin", color="E5E6EB")
+
+    @classmethod
+    def _border(cls):
+        return Border(
+            left=cls.BORDER_SIDE, right=cls.BORDER_SIDE,
+            top=cls.BORDER_SIDE,  bottom=cls.BORDER_SIDE,
+        )
+
+    @classmethod
+    def export_results(cls, path: str, headers: list[str],
+                       rows: list[list[str]], status_col: int = None):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "函数结果"
+
+        # 写表头
+        for ci, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=ci, value=h)
+            cell.fill       = cls.HEADER_FILL
+            cell.font       = cls.HEADER_FONT
+            cell.alignment  = Alignment(horizontal="center", vertical="center")
+            cell.border     = cls._border()
+        ws.row_dimensions[1].height = 22
+
+        # 写数据
+        for ri, row in enumerate(rows, 2):
+            fill = None
+            if status_col is not None and status_col < len(row):
+                fill = cls.MATCH_FILL if row[status_col] == "MATCH" else cls.NOMATCH_FILL
+            for ci, val in enumerate(row, 1):
+                cell = ws.cell(row=ri, column=ci, value=val)
+                cell.alignment = Alignment(vertical="center")
+                cell.border    = cls._border()
+                if fill:
+                    cell.fill = fill
+
+        # 自适应列宽
+        for col in ws.columns:
+            max_w = max((len(str(c.value or "")) for c in col), default=8)
+            ws.column_dimensions[col[0].column_letter].width = min(max_w + 4, 40)
+
+        wb.save(path)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GUI 组件 — 通用工具
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _style_button(btn: ttk.Button, kind="primary"):
+    """为按钮设置外观（ttk 主题无法完全控制，用 tk.Button 作为替代）"""
+    pass  # 通过自定义 style 实现
+
+def make_label_btn(parent, text, command, bg=None, fg="white",
+                   padx=12, pady=4, font_size=9, radius=4):
+    bg = bg or COLORS["primary"]
+    btn = tk.Button(parent, text=text, command=command,
+                    bg=bg, fg=fg, relief="flat", cursor="hand2",
+                    padx=padx, pady=pady,
+                    font=("Microsoft YaHei UI", font_size),
+                    activebackground=COLORS["primary_dark"],
+                    activeforeground="white",
+                    bd=0)
+    return btn
+
+def make_card(parent, **kwargs):
+    frame = tk.Frame(parent, bg=COLORS["card"],
+                     relief="flat", bd=1,
+                     highlightbackground=COLORS["border"],
+                     highlightthickness=1,
+                     **kwargs)
+    return frame
+
+def make_section_label(parent, text, sub=False):
+    color = COLORS["text_sub"] if sub else COLORS["text"]
+    size  = 8 if sub else 10
+    lbl = tk.Label(parent, text=text, bg=COLORS["card"],
+                   fg=color, font=("Microsoft YaHei UI", size, "bold" if not sub else ""))
+    return lbl
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GUI 面板 1 — 数据源管理
+# ═════════════════════════════════════════════════════════════════════════════
+
+class DataSourcePanel(tk.Frame):
+    """管理飞书表格数据源（添加/刷新/删除/预览）"""
+
+    def __init__(self, master, cache: DataCache, api: FeishuAPIClient,
+                 on_sources_changed=None, **kwargs):
+        super().__init__(master, bg=COLORS["bg"], **kwargs)
+        self.cache   = cache
+        self.api     = api
+        self.on_change = on_sources_changed
+        self._build_ui()
+        self.refresh_table()
+
+    def _build_ui(self):
+        # ── 顶栏 ──────────────────────────────────────────────────────────────
+        top = tk.Frame(self, bg=COLORS["bg"])
+        top.pack(fill="x", padx=16, pady=(12, 6))
+
+        tk.Label(top, text="数据源管理", bg=COLORS["bg"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
+
+        btn_frame = tk.Frame(top, bg=COLORS["bg"])
+        btn_frame.pack(side="right")
+        make_label_btn(btn_frame, "+ 添加数据源", self._open_add_dialog).pack(side="left", padx=4)
+        make_label_btn(btn_frame, "↻ 同步选中", self._sync_selected,
+                       bg=COLORS["success"]).pack(side="left", padx=4)
+        make_label_btn(btn_frame, "× 删除选中", self._delete_selected,
+                       bg=COLORS["error"]).pack(side="left", padx=4)
+
+        # ── 数据源列表 ────────────────────────────────────────────────────────
+        list_card = make_card(self)
+        list_card.pack(fill="both", expand=True, padx=16, pady=6)
+
+        cols = ("id", "name", "token", "sheet_title", "row_count", "col_count", "synced_at")
+        self.tree = ttk.Treeview(list_card, columns=cols, show="headings",
+                                 selectmode="extended", height=12)
+
+        hdrs = {"id": (40, "ID"), "name": (150, "名称"),
+                "token": (220, "Token"),
+                "sheet_title": (140, "工作表"),
+                "row_count": (70, "行数"),
+                "col_count": (70, "列数"),
+                "synced_at": (150, "同步时间")}
+        for col, (w, h) in hdrs.items():
+            self.tree.heading(col, text=h)
+            self.tree.column(col, width=w, minwidth=40)
+
+        vsb = ttk.Scrollbar(list_card, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(list_card, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        list_card.rowconfigure(0, weight=1)
+        list_card.columnconfigure(0, weight=1)
+
+        self.tree.bind("<Double-1>", self._preview_source)
+
+        # ── 预览区 ────────────────────────────────────────────────────────────
+        prev_card = make_card(self)
+        prev_card.pack(fill="both", expand=True, padx=16, pady=(4, 12))
+
+        hdr = tk.Frame(prev_card, bg=COLORS["card"])
+        hdr.pack(fill="x", padx=8, pady=4)
+        tk.Label(hdr, text="数据预览（前 50 行）", bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
+        self.preview_info = tk.Label(hdr, text="", bg=COLORS["card"],
+                                     fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 8))
+        self.preview_info.pack(side="right")
+
+        self.preview_tree = ttk.Treeview(prev_card, show="headings",
+                                         height=8, selectmode="none")
+        psb = ttk.Scrollbar(prev_card, orient="vertical",
+                            command=self.preview_tree.yview)
+        phsb = ttk.Scrollbar(prev_card, orient="horizontal",
+                             command=self.preview_tree.xview)
+        self.preview_tree.configure(yscrollcommand=psb.set, xscrollcommand=phsb.set)
+        self.preview_tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+        psb.pack(side="right", fill="y", pady=(0, 8))
+        phsb.pack(side="bottom", fill="x", padx=8)
+
+    # ── 刷新主列表 ────────────────────────────────────────────────────────────
+
+    def refresh_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for src in self.cache.list_sources():
+            self.tree.insert("", "end", iid=str(src["id"]), values=(
+                src["id"], src["name"], src["token"],
+                src["sheet_title"] or "-",
+                src["row_count"] or "-",
+                src["col_count"] or "-",
+                src["synced_at"] or "未同步",
+            ))
+
+    # ── 预览数据源 ────────────────────────────────────────────────────────────
+
+    def _preview_source(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        source_id = int(sel[0])
+        src = self.cache.get_source(source_id)
+        if not src or not src["synced_at"]:
+            messagebox.showinfo("提示", "该数据源尚未同步，请先同步数据", parent=self)
+            return
+
+        rows    = self.cache.get_all_rows(source_id)
+        headers = rows[0] if rows else []
+        data    = rows[1:51] if len(rows) > 1 else []
+
+        # 重建预览表
+        pt = self.preview_tree
+        pt.delete(*pt.get_children())
+        if not headers:
+            return
+
+        # 动态设置列
+        col_ids = [f"c{i}" for i in range(len(headers))]
+        pt["columns"] = col_ids
+        for ci, (cid, h) in enumerate(zip(col_ids, headers)):
+            pt.heading(cid, text=h or f"列{ci+1}")
+            pt.column(cid, width=100, minwidth=60)
+
+        for ri, row in enumerate(data):
+            padded = row + [""] * (len(headers) - len(row))
+            tag = "even" if ri % 2 == 0 else "odd"
+            pt.insert("", "end", values=padded, tags=(tag,))
+
+        pt.tag_configure("even", background=COLORS["row_even"])
+        pt.tag_configure("odd",  background=COLORS["row_odd"])
+
+        self.preview_info.config(
+            text=f"共 {len(rows)-1} 行 × {len(headers)} 列 | 当前源: {src['name']}"
+        )
+
+    # ── 添加对话框 ────────────────────────────────────────────────────────────
+
+    def _open_add_dialog(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("添加飞书数据源")
+        dlg.geometry("560x560")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.configure(bg=COLORS["bg"])
+
+        tk.Label(dlg, text="添加飞书表格数据源", bg=COLORS["bg"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(16, 4))
+        tk.Label(dlg, text="填写飞书表格信息，系统将拉取该 Sheet 所有数据", bg=COLORS["bg"],
+                 fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 9)).pack(pady=(0, 12))
+
+        form = make_card(dlg)
+        form.pack(fill="x", padx=20, pady=4)
+
+        fields = [
+            ("数据源名称 *", "name",    "给这个数据源起个名字，如「物料库2024」"),
+            ("表格 Token *", "token",   "飞书表格 URL 中的 token 参数"),
+            ("工作表 ID",    "sheet_id","留空则自动列出所有工作表"),
+            ("工作表名称",   "sheet_title", "可选，便于识别"),
+        ]
+
+        entries: dict[str, tk.StringVar] = {}
+        for row_i, (label, key, hint) in enumerate(fields):
+            tk.Label(form, text=label, bg=COLORS["card"], fg=COLORS["text"],
+                     font=("Microsoft YaHei UI", 9, "bold")).grid(
+                         row=row_i*2, column=0, padx=12, pady=(10, 0), sticky="w")
+            var = tk.StringVar()
+            entries[key] = var
+            e = ttk.Entry(form, textvariable=var, width=48)
+            e.grid(row=row_i*2, column=1, padx=12, pady=(10, 0), sticky="ew")
+            tk.Label(form, text=hint, bg=COLORS["card"], fg=COLORS["text_sub"],
+                     font=("Microsoft YaHei UI", 7)).grid(
+                         row=row_i*2+1, column=1, padx=12, sticky="w")
+        form.columnconfigure(1, weight=1)
+
+        # API 模式
+        api_frame = make_card(dlg)
+        api_frame.pack(fill="x", padx=20, pady=8)
+        use_open = tk.BooleanVar(value=False)
+        tk.Label(api_frame, text="API 模式", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold")).grid(
+                     row=0, column=0, padx=12, pady=8, sticky="w")
+        ttk.Radiobutton(api_frame, text="内网代理 (默认)", variable=use_open,
+                        value=False).grid(row=0, column=1, padx=8)
+        ttk.Radiobutton(api_frame, text="飞书开放平台 API", variable=use_open,
+                        value=True).grid(row=0, column=2, padx=8)
+
+        # 如果选了开放平台，显示 access_token 输入
+        at_frame = tk.Frame(api_frame, bg=COLORS["card"])
+        at_frame.grid(row=1, column=0, columnspan=3, padx=12, pady=(0, 8), sticky="ew")
+        tk.Label(at_frame, text="Access Token", bg=COLORS["card"],
+                 fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 8)).pack(side="left")
+        at_var = tk.StringVar()
+        ttk.Entry(at_frame, textvariable=at_var, width=40, show="*").pack(side="left", padx=8)
+        entries["access_token"] = at_var
+
+        # 行数范围
+        range_frame = make_card(dlg)
+        range_frame.pack(fill="x", padx=20, pady=4)
+        tk.Label(range_frame, text="最大拉取行数", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold")).grid(
+                     row=0, column=0, padx=12, pady=8, sticky="w")
+        max_rows_var = tk.StringVar(value="5000")
+        ttk.Entry(range_frame, textvariable=max_rows_var, width=10).grid(
+            row=0, column=1, padx=8)
+        tk.Label(range_frame, text="行（含表头）", bg=COLORS["card"],
+                 fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 8)).grid(
+                     row=0, column=2, sticky="w")
+        entries["max_rows"] = max_rows_var
+
+        # 状态日志
+        log_var = tk.StringVar(value="等待操作...")
+        tk.Label(dlg, textvariable=log_var, bg=COLORS["bg"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 8), wraplength=500).pack(pady=4)
+
+        # 按钮
+        btn_row = tk.Frame(dlg, bg=COLORS["bg"])
+        btn_row.pack(pady=12)
+
+        def do_fetch_sheets():
+            token = entries["token"].get().strip()
+            if not token:
+                messagebox.showwarning("提示", "请填写表格 Token", parent=dlg)
+                return
+            log_var.set("正在拉取工作表列表...")
+            self.api.access_token = entries.get("access_token", tk.StringVar()).get()
+            try:
+                sheets = self.api.fetch_meta(token, use_open_api=use_open.get())
+                if not sheets:
+                    log_var.set("未找到工作表，请检查 Token")
+                    return
+                entries["sheet_id"].set(sheets[0]["sheet_id"])
+                entries["sheet_title"].set(sheets[0]["sheet_title"])
+                log_var.set(f"发现 {len(sheets)} 个工作表，已自动填入第一个")
+            except Exception as ex:
+                log_var.set(f"拉取失败: {ex}")
+
+        def do_add():
+            name  = entries["name"].get().strip()
+            token = entries["token"].get().strip()
+            sid   = entries["sheet_id"].get().strip()
+            title = entries["sheet_title"].get().strip()
+            if not name or not token or not sid:
+                messagebox.showwarning("提示", "名称、Token、工作表 ID 为必填项", parent=dlg)
+                return
+            try:
+                max_r = int(entries["max_rows"].get().strip() or "5000")
+            except ValueError:
+                max_r = 5000
+
+            log_var.set("正在拉取数据...")
+            dlg.update_idletasks()
+
+            def worker():
+                try:
+                    self.api.access_token = entries.get("access_token", tk.StringVar()).get()
+                    rows = self.api.fetch_values(token, sid,
+                                                 use_open_api=use_open.get(),
+                                                 max_rows=max_r)
+                    src_id = self.cache.add_source(
+                        name, token, sid, title, use_open.get()
+                    )
+                    self.cache.store_rows(src_id, rows)
+                    dlg.after(0, lambda: log_var.set(
+                        f"完成！共拉取 {len(rows)} 行数据"))
+                    dlg.after(100, lambda: [
+                        self.refresh_table(),
+                        self.on_change and self.on_change(),
+                    ])
+                except Exception as ex:
+                    dlg.after(0, lambda: log_var.set(f"失败: {ex}"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        make_label_btn(btn_row, "🔍 拉取工作表列表", do_fetch_sheets,
+                       bg=COLORS["warning"]).pack(side="left", padx=6)
+        make_label_btn(btn_row, "✓ 添加并同步", do_add).pack(side="left", padx=6)
+        make_label_btn(btn_row, "取消", dlg.destroy,
+                       bg=COLORS["text_sub"]).pack(side="left", padx=6)
+
+    # ── 同步 ─────────────────────────────────────────────────────────────────
+
+    def _sync_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选中要同步的数据源", parent=self)
+            return
+        for iid in sel:
+            src = self.cache.get_source(int(iid))
+            if not src:
+                continue
+
+            def worker(s=src):
+                try:
+                    rows = self.api.fetch_values(
+                        s["token"], s["sheet_id"],
+                        use_open_api=bool(s["use_open_api"])
+                    )
+                    self.cache.store_rows(s["id"], rows)
+                    self.after(0, self.refresh_table)
+                    self.after(0, lambda: self.on_change and self.on_change())
+                except Exception as ex:
+                    self.after(0, lambda e=ex: messagebox.showerror(
+                        "同步失败", str(e), parent=self))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    # ── 删除 ─────────────────────────────────────────────────────────────────
+
+    def _delete_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        if not messagebox.askyesno("确认", f"删除选中的 {len(sel)} 个数据源？", parent=self):
+            return
+        for iid in sel:
+            self.cache.delete_source(int(iid))
+        self.refresh_table()
+        if self.on_change:
+            self.on_change()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GUI 面板 2 — 函数构建器
+# ═════════════════════════════════════════════════════════════════════════════
+
+class FunctionBuilderPanel(tk.Frame):
+    """可视化函数参数配置 + 执行"""
+
+    def __init__(self, master, cache: DataCache, on_results=None, **kwargs):
+        super().__init__(master, bg=COLORS["bg"], **kwargs)
+        self.cache      = cache
+        self.on_results = on_results  # callback(headers, rows, func_type)
+        self._sources: list[dict] = []
+        self._rows_cache: dict[int, list[list[str]]] = {}
+        self._build_ui()
+        self.reload_sources()
+
+    def reload_sources(self):
+        self._sources = self.cache.list_sources()
+        self._rows_cache.clear()
+        self._update_source_dropdowns()
+
+    def _get_rows(self, source_id: int) -> list[list[str]]:
+        if source_id not in self._rows_cache:
+            self._rows_cache[source_id] = self.cache.get_all_rows(source_id)
+        return self._rows_cache[source_id]
+
+    def _source_names(self) -> list[str]:
+        return [f"{s['id']}: {s['name']} [{s['sheet_title'] or s['sheet_id']}]"
+                for s in self._sources]
+
+    def _source_by_choice(self, choice: str) -> dict | None:
+        try:
+            sid = int(choice.split(":")[0])
+            return next((s for s in self._sources if s["id"] == sid), None)
+        except (ValueError, IndexError):
+            return None
+
+    def _headers_for_source(self, choice: str) -> list[str]:
+        src = self._source_by_choice(choice)
+        if not src:
+            return []
+        rows = self._get_rows(src["id"])
+        return rows[0] if rows else []
+
+    def _build_ui(self):
+        # ── 顶栏 ──────────────────────────────────────────────────────────────
+        top = tk.Frame(self, bg=COLORS["bg"])
+        top.pack(fill="x", padx=16, pady=(12, 4))
+        tk.Label(top, text="函数构建器", bg=COLORS["bg"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
+
+        # ── 函数类型选择 ──────────────────────────────────────────────────────
+        type_card = make_card(self)
+        type_card.pack(fill="x", padx=16, pady=4)
+        tk.Label(type_card, text="选择函数类型", bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 9, "bold")).pack(
+                     anchor="w", padx=12, pady=(8, 4))
+
+        self._func_var = tk.StringVar(value="VLOOKUP")
+        btn_row = tk.Frame(type_card, bg=COLORS["card"])
+        btn_row.pack(fill="x", padx=12, pady=(0, 8))
+
+        self._func_btns: dict[str, tk.Label] = {}
+        for fname in FUNCTION_DEFS:
+            lbl = tk.Label(btn_row, text=fname, bg=COLORS["border"],
+                           fg=COLORS["text"], cursor="hand2",
+                           font=("Microsoft YaHei UI", 9),
+                           padx=12, pady=5, relief="flat")
+            lbl.pack(side="left", padx=4)
+            lbl.bind("<Button-1>", lambda e, f=fname: self._select_func(f))
+            self._func_btns[fname] = lbl
+
+        self.func_desc = tk.Label(type_card, text=FUNCTION_DEFS["VLOOKUP"],
+                                  bg=COLORS["card"], fg=COLORS["text_sub"],
+                                  font=("Microsoft YaHei UI", 8))
+        self.func_desc.pack(anchor="w", padx=12, pady=(0, 8))
+
+        # ── 参数面板容器（动态切换）────────────────────────────────────────────
+        self._param_container = tk.Frame(self, bg=COLORS["bg"])
+        self._param_container.pack(fill="both", expand=True, padx=16, pady=4)
+
+        self._param_panels: dict[str, tk.Frame] = {}
+        self._build_vlookup_panel()
+        self._build_xlookup_panel()
+        self._build_index_match_panel()
+        self._build_sumif_panel()
+        self._build_countif_panel()
+        self._build_sumifs_panel()
+
+        # ── 执行按钮栏 ────────────────────────────────────────────────────────
+        run_bar = tk.Frame(self, bg=COLORS["bg"])
+        run_bar.pack(fill="x", padx=16, pady=8)
+        make_label_btn(run_bar, "▶  执行函数", self._run_function,
+                       padx=20, pady=6, font_size=10).pack(side="left", padx=4)
+        make_label_btn(run_bar, "↻ 重置参数", self._reset_params,
+                       bg=COLORS["text_sub"]).pack(side="left", padx=4)
+
+        self._run_info = tk.Label(run_bar, text="", bg=COLORS["bg"],
+                                  fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 8))
+        self._run_info.pack(side="right", padx=8)
+
+        self._select_func("VLOOKUP")
+
+    def _select_func(self, fname: str):
+        self._func_var.set(fname)
+        for f, btn in self._func_btns.items():
+            if f == fname:
+                btn.config(bg=COLORS["primary"], fg="white")
+            else:
+                btn.config(bg=COLORS["border"], fg=COLORS["text"])
+        self.func_desc.config(text=FUNCTION_DEFS.get(fname, ""))
+        for f, panel in self._param_panels.items():
+            if f == fname:
+                panel.pack(fill="both", expand=True)
+            else:
+                panel.pack_forget()
+
+    def _update_source_dropdowns(self):
+        names = self._source_names()
+        # 更新所有 Combobox（收集所有子组件中的 ttk.Combobox）
+        for widget in self._param_container.winfo_children():
+            self._update_cb_in_frame(widget, names)
+
+    def _update_cb_in_frame(self, frame, names):
+        for child in frame.winfo_children():
+            if isinstance(child, ttk.Combobox) and getattr(child, "_is_source_cb", False):
+                child["values"] = names
+            self._update_cb_in_frame(child, names)
+
+    # ── 构建各函数参数面板 ─────────────────────────────────────────────────────
+
+    def _make_source_row(self, parent, row_i: int, label: str,
+                         src_var: tk.StringVar, col_var: tk.StringVar,
+                         col_label: str = "列") -> ttk.Combobox:
+        """通用辅助：数据源 + 列选择行"""
+        tk.Label(parent, text=label, bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=row_i, column=0, padx=(12, 4), pady=6)
+
+        src_cb = ttk.Combobox(parent, textvariable=src_var, width=34, state="readonly")
+        src_cb["values"] = self._source_names()
+        src_cb._is_source_cb = True
+        src_cb.grid(row=row_i, column=1, padx=4, pady=6, sticky="w")
+
+        tk.Label(parent, text=col_label, bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9)).grid(row=row_i, column=2, padx=(8, 4))
+
+        col_cb = ttk.Combobox(parent, textvariable=col_var, width=18, state="readonly")
+        col_cb.grid(row=row_i, column=3, padx=4, pady=6, sticky="w")
+
+        def on_src_change(*_):
+            headers = self._headers_for_source(src_var.get())
+            col_cb["values"] = [f"{i}: {h}" for i, h in enumerate(headers)]
+            if headers:
+                col_var.set(col_cb["values"][0])
+
+        src_cb.bind("<<ComboboxSelected>>", on_src_change)
+        return src_cb
+
+    def _col_idx_from_var(self, var: tk.StringVar) -> int:
+        v = var.get()
+        try:
+            return int(v.split(":")[0])
+        except (ValueError, IndexError):
+            return 0
+
+    def _build_vlookup_panel(self):
+        panel = make_card(self._param_container)
+        self._param_panels["VLOOKUP"] = panel
+
+        tk.Label(panel, text="VLOOKUP 参数", bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=4, padx=12, pady=(10, 4), sticky="w")
+
+        self._vl = {}  # param vars
+
+        self._vl["lv_src"]     = tk.StringVar()
+        self._vl["lv_col"]     = tk.StringVar()
+        self._vl["tbl_src"]    = tk.StringVar()
+        self._vl["key_col"]    = tk.StringVar()
+        self._vl["match_mode"] = tk.StringVar(value="exact")
+        self._vl["not_found"]  = tk.StringVar(value="#N/A")
+
+        self._make_source_row(panel, 1, "查找值来源", self._vl["lv_src"],
+                              self._vl["lv_col"], "查找值列")
+        self._make_source_row(panel, 2, "查找范围表格", self._vl["tbl_src"],
+                              self._vl["key_col"], "查找键列")
+
+        # 返回列（多选）
+        tk.Label(panel, text="返回列（可多选）", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=3, column=0, padx=(12, 4), pady=6)
+        self._vl_ret_frame = tk.Frame(panel, bg=COLORS["card"])
+        self._vl_ret_frame.grid(row=3, column=1, columnspan=3, sticky="w", padx=4)
+        self._vl["ret_lb"] = tk.Listbox(self._vl_ret_frame, selectmode="multiple",
+                                         height=4, width=40)
+        ret_sb = ttk.Scrollbar(self._vl_ret_frame, command=self._vl["ret_lb"].yview)
+        self._vl["ret_lb"].configure(yscrollcommand=ret_sb.set)
+        self._vl["ret_lb"].pack(side="left")
+        ret_sb.pack(side="left", fill="y")
+
+        def update_ret_lb(*_):
+            headers = self._headers_for_source(self._vl["tbl_src"].get())
+            lb = self._vl["ret_lb"]
+            lb.delete(0, "end")
+            for i, h in enumerate(headers):
+                lb.insert("end", f"{i}: {h}")
+        self._vl["tbl_src"].trace_add("write", update_ret_lb)
+
+        # 匹配模式
+        tk.Label(panel, text="匹配模式", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=4, column=0, padx=(12, 4), pady=6)
+        mode_frame = tk.Frame(panel, bg=COLORS["card"])
+        mode_frame.grid(row=4, column=1, columnspan=3, sticky="w", padx=4)
+        for mode_val, mode_lbl in MATCH_MODES:
+            ttk.Radiobutton(mode_frame, text=mode_lbl,
+                            variable=self._vl["match_mode"],
+                            value=mode_val).pack(side="left", padx=6)
+
+        # 未找到时默认值
+        tk.Label(panel, text="未找到默认值", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=5, column=0, padx=(12, 4), pady=6)
+        ttk.Entry(panel, textvariable=self._vl["not_found"], width=20).grid(
+            row=5, column=1, padx=4, sticky="w")
+
+        panel.columnconfigure(1, weight=1)
+
+    def _build_xlookup_panel(self):
+        panel = make_card(self._param_container)
+        self._param_panels["XLOOKUP"] = panel
+
+        tk.Label(panel, text="XLOOKUP 参数（支持跨表查找）", bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=4, padx=12, pady=(10, 4), sticky="w")
+
+        self._xl = {}
+        self._xl["lv_src"]      = tk.StringVar()
+        self._xl["lv_col"]      = tk.StringVar()
+        self._xl["search_src"]  = tk.StringVar()
+        self._xl["search_col"]  = tk.StringVar()
+        self._xl["return_src"]  = tk.StringVar()
+        self._xl["match_mode"]  = tk.StringVar(value="exact")
+        self._xl["not_found"]   = tk.StringVar(value="#N/A")
+
+        self._make_source_row(panel, 1, "查找值来源", self._xl["lv_src"],
+                              self._xl["lv_col"], "查找值列")
+        self._make_source_row(panel, 2, "搜索列来源", self._xl["search_src"],
+                              self._xl["search_col"], "搜索列")
+
+        # 返回数据源（可以不同于搜索源）
+        tk.Label(panel, text="返回数据来源", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=3, column=0, padx=(12, 4), pady=6)
+        ret_src_cb = ttk.Combobox(panel, textvariable=self._xl["return_src"],
+                                   width=34, state="readonly")
+        ret_src_cb["values"]    = self._source_names()
+        ret_src_cb._is_source_cb = True
+        ret_src_cb.grid(row=3, column=1, padx=4, sticky="w")
+
+        tk.Label(panel, text="返回列（多选）", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=4, column=0, padx=(12, 4), pady=6)
+        xl_ret_frame = tk.Frame(panel, bg=COLORS["card"])
+        xl_ret_frame.grid(row=4, column=1, columnspan=3, sticky="w", padx=4)
+        self._xl["ret_lb"] = tk.Listbox(xl_ret_frame, selectmode="multiple",
+                                         height=4, width=40)
+        xl_ret_sb = ttk.Scrollbar(xl_ret_frame, command=self._xl["ret_lb"].yview)
+        self._xl["ret_lb"].configure(yscrollcommand=xl_ret_sb.set)
+        self._xl["ret_lb"].pack(side="left")
+        xl_ret_sb.pack(side="left", fill="y")
+
+        def update_xl_ret(*_):
+            headers = self._headers_for_source(self._xl["return_src"].get())
+            lb = self._xl["ret_lb"]
+            lb.delete(0, "end")
+            for i, h in enumerate(headers):
+                lb.insert("end", f"{i}: {h}")
+        self._xl["return_src"].trace_add("write", update_xl_ret)
+
+        tk.Label(panel, text="匹配模式", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=5, column=0, padx=(12, 4), pady=6)
+        mode_frame = tk.Frame(panel, bg=COLORS["card"])
+        mode_frame.grid(row=5, column=1, columnspan=3, sticky="w", padx=4)
+        for mode_val, mode_lbl in MATCH_MODES:
+            ttk.Radiobutton(mode_frame, text=mode_lbl,
+                            variable=self._xl["match_mode"],
+                            value=mode_val).pack(side="left", padx=6)
+
+        tk.Label(panel, text="未找到默认值", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=6, column=0, padx=(12, 4), pady=6)
+        ttk.Entry(panel, textvariable=self._xl["not_found"], width=20).grid(
+            row=6, column=1, padx=4, sticky="w")
+
+        panel.columnconfigure(1, weight=1)
+
+    def _build_index_match_panel(self):
+        panel = make_card(self._param_container)
+        self._param_panels["INDEX/MATCH"] = panel
+
+        tk.Label(panel, text="INDEX/MATCH 参数（支持跨表）", bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=4, padx=12, pady=(10, 4), sticky="w")
+
+        self._im = {}
+        self._im["lv_src"]      = tk.StringVar()
+        self._im["lv_col"]      = tk.StringVar()
+        self._im["match_src"]   = tk.StringVar()
+        self._im["match_col"]   = tk.StringVar()
+        self._im["index_src"]   = tk.StringVar()
+        self._im["index_col"]   = tk.StringVar()
+        self._im["match_mode"]  = tk.StringVar(value="exact")
+        self._im["not_found"]   = tk.StringVar(value="#N/A")
+
+        self._make_source_row(panel, 1, "查找值来源",  self._im["lv_src"],  self._im["lv_col"],  "查找值列")
+        self._make_source_row(panel, 2, "MATCH 搜索表", self._im["match_src"], self._im["match_col"], "搜索列")
+        self._make_source_row(panel, 3, "INDEX 返回表", self._im["index_src"], self._im["index_col"], "返回列")
+
+        tk.Label(panel, text="匹配模式", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=4, column=0, padx=(12, 4), pady=6)
+        mode_frame = tk.Frame(panel, bg=COLORS["card"])
+        mode_frame.grid(row=4, column=1, columnspan=3, sticky="w", padx=4)
+        for mode_val, mode_lbl in MATCH_MODES:
+            ttk.Radiobutton(mode_frame, text=mode_lbl,
+                            variable=self._im["match_mode"],
+                            value=mode_val).pack(side="left", padx=6)
+
+        tk.Label(panel, text="未找到默认值", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=5, column=0, padx=(12, 4), pady=6)
+        ttk.Entry(panel, textvariable=self._im["not_found"], width=20).grid(
+            row=5, column=1, padx=4, sticky="w")
+        panel.columnconfigure(1, weight=1)
+
+    def _build_sumif_panel(self):
+        panel = make_card(self._param_container)
+        self._param_panels["SUMIF"] = panel
+
+        tk.Label(panel, text="SUMIF 参数", bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=4, padx=12, pady=(10, 4), sticky="w")
+
+        self._si = {}
+        self._si["tbl_src"]      = tk.StringVar()
+        self._si["criteria_col"] = tk.StringVar()
+        self._si["criteria"]     = tk.StringVar()
+        self._si["sum_col"]      = tk.StringVar()
+        self._si["match_mode"]   = tk.StringVar(value="exact")
+
+        self._make_source_row(panel, 1, "数据表格", self._si["tbl_src"],
+                              self._si["criteria_col"], "条件列")
+
+        tk.Label(panel, text="条件值 *", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=2, column=0, padx=(12, 4), pady=6)
+        ttk.Entry(panel, textvariable=self._si["criteria"], width=30).grid(
+            row=2, column=1, padx=4, sticky="w")
+
+        tk.Label(panel, text="求和列", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=3, column=0, padx=(12, 4), pady=6)
+        self._si_sum_cb = ttk.Combobox(panel, textvariable=self._si["sum_col"],
+                                        width=20, state="readonly")
+        self._si_sum_cb.grid(row=3, column=1, padx=4, sticky="w")
+
+        def update_sum_col(*_):
+            headers = self._headers_for_source(self._si["tbl_src"].get())
+            opts = [f"{i}: {h}" for i, h in enumerate(headers)]
+            self._si_sum_cb["values"] = opts
+
+        self._si["tbl_src"].trace_add("write", update_sum_col)
+
+        tk.Label(panel, text="匹配模式", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=4, column=0, padx=(12, 4), pady=6)
+        mode_frame = tk.Frame(panel, bg=COLORS["card"])
+        mode_frame.grid(row=4, column=1, columnspan=3, sticky="w", padx=4)
+        for mode_val, mode_lbl in MATCH_MODES:
+            ttk.Radiobutton(mode_frame, text=mode_lbl,
+                            variable=self._si["match_mode"],
+                            value=mode_val).pack(side="left", padx=6)
+        panel.columnconfigure(1, weight=1)
+
+    def _build_countif_panel(self):
+        panel = make_card(self._param_container)
+        self._param_panels["COUNTIF"] = panel
+
+        tk.Label(panel, text="COUNTIF 参数", bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=4, padx=12, pady=(10, 4), sticky="w")
+
+        self._ci = {}
+        self._ci["tbl_src"]      = tk.StringVar()
+        self._ci["criteria_col"] = tk.StringVar()
+        self._ci["criteria"]     = tk.StringVar()
+        self._ci["match_mode"]   = tk.StringVar(value="exact")
+
+        self._make_source_row(panel, 1, "数据表格", self._ci["tbl_src"],
+                              self._ci["criteria_col"], "统计列")
+
+        tk.Label(panel, text="条件值 *", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=2, column=0, padx=(12, 4), pady=6)
+        ttk.Entry(panel, textvariable=self._ci["criteria"], width=30).grid(
+            row=2, column=1, padx=4, sticky="w")
+
+        tk.Label(panel, text="匹配模式", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(row=3, column=0, padx=(12, 4), pady=6)
+        mode_frame = tk.Frame(panel, bg=COLORS["card"])
+        mode_frame.grid(row=3, column=1, columnspan=3, sticky="w", padx=4)
+        for mode_val, mode_lbl in MATCH_MODES:
+            ttk.Radiobutton(mode_frame, text=mode_lbl,
+                            variable=self._ci["match_mode"],
+                            value=mode_val).pack(side="left", padx=6)
+        panel.columnconfigure(1, weight=1)
+
+    def _build_sumifs_panel(self):
+        panel = make_card(self._param_container)
+        self._param_panels["SUMIFS"] = panel
+
+        tk.Label(panel, text="SUMIFS 参数（最多 4 个条件）", bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=6, padx=12, pady=(10, 4), sticky="w")
+
+        self._sifs = {}
+        self._sifs["tbl_src"] = tk.StringVar()
+        self._sifs["sum_col"] = tk.StringVar()
+
+        # 数据源
+        tk.Label(panel, text="数据表格", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=12, anchor="e").grid(row=1, column=0, padx=(12, 4), pady=6)
+        src_cb = ttk.Combobox(panel, textvariable=self._sifs["tbl_src"],
+                               width=34, state="readonly")
+        src_cb["values"]    = self._source_names()
+        src_cb._is_source_cb = True
+        src_cb.grid(row=1, column=1, padx=4, columnspan=2, sticky="w")
+
+        tk.Label(panel, text="求和列", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=8, anchor="e").grid(row=1, column=3, padx=4)
+        self._sifs_sum_cb = ttk.Combobox(panel, textvariable=self._sifs["sum_col"],
+                                          width=18, state="readonly")
+        self._sifs_sum_cb.grid(row=1, column=4, padx=4)
+
+        def update_sifs_cols(*_):
+            headers = self._headers_for_source(self._sifs["tbl_src"].get())
+            opts = [f"{i}: {h}" for i, h in enumerate(headers)]
+            self._sifs_sum_cb["values"] = opts
+            for i in range(4):
+                self._sifs[f"cond{i}_col_cb"]["values"] = opts
+        self._sifs["tbl_src"].trace_add("write", update_sifs_cols)
+
+        # 4 个条件行
+        cond_hdr = tk.Frame(panel, bg=COLORS["card"])
+        cond_hdr.grid(row=2, column=0, columnspan=6, padx=12, pady=(8, 2), sticky="w")
+        for txt, w in [("条件列", 20), ("条件值", 20), ("匹配模式", 16)]:
+            tk.Label(cond_hdr, text=txt, bg=COLORS["card"], fg=COLORS["text_sub"],
+                     font=("Microsoft YaHei UI", 8), width=w).pack(side="left", padx=4)
+
+        for i in range(4):
+            col_var  = tk.StringVar()
+            crit_var = tk.StringVar()
+            mode_var = tk.StringVar(value="exact")
+            self._sifs[f"cond{i}_col"]  = col_var
+            self._sifs[f"cond{i}_crit"] = crit_var
+            self._sifs[f"cond{i}_mode"] = mode_var
+
+            row_f = tk.Frame(panel, bg=COLORS["card"])
+            row_f.grid(row=3+i, column=0, columnspan=6, padx=12, pady=2, sticky="w")
+
+            tk.Label(row_f, text=f"条件 {i+1}", bg=COLORS["card"],
+                     fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 8),
+                     width=6).pack(side="left")
+            col_cb = ttk.Combobox(row_f, textvariable=col_var, width=22, state="readonly")
+            col_cb.pack(side="left", padx=4)
+            self._sifs[f"cond{i}_col_cb"] = col_cb
+            ttk.Entry(row_f, textvariable=crit_var, width=20).pack(side="left", padx=4)
+            mode_cb = ttk.Combobox(row_f, textvariable=mode_var, width=12,
+                                    values=[m[0] for m in MATCH_MODES], state="readonly")
+            mode_cb.pack(side="left", padx=4)
+
+        panel.columnconfigure(1, weight=1)
+
+    def _reset_params(self):
+        self._rows_cache.clear()
+
+    # ── 执行函数 ───────────────────────────────────────────────────────────────
+
+    def _run_function(self):
+        fname = self._func_var.get()
+        self._run_info.config(text="执行中...", fg=COLORS["warning"])
+        self.update_idletasks()
+
+        def worker():
+            try:
+                headers, rows, status_col = self._execute(fname)
+                self.after(0, lambda: self._run_info.config(
+                    text=f"完成  共 {len(rows)} 行结果", fg=COLORS["success"]))
+                if self.on_results:
+                    self.after(0, lambda: self.on_results(headers, rows, fname))
+            except Exception as ex:
+                self.after(0, lambda e=ex: [
+                    self._run_info.config(text=f"错误: {e}", fg=COLORS["error"]),
+                    messagebox.showerror("执行失败", str(e), parent=self),
+                ])
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _get_source_rows(self, var: tk.StringVar) -> list[list[str]]:
+        src = self._source_by_choice(var.get())
+        if not src:
+            raise ValueError(f"请选择数据源（当前: {var.get()!r}）")
+        if not src.get("synced_at"):
+            raise ValueError(f"数据源「{src['name']}」尚未同步，请先同步")
+        return self._get_rows(src["id"])
+
+    def _execute(self, fname: str):
+        engine = FormulaEngine()
+
+        if fname == "VLOOKUP":
+            lv_rows  = self._get_source_rows(self._vl["lv_src"])
+            tbl_rows = self._get_source_rows(self._vl["tbl_src"])
+            lv_col   = self._col_idx_from_var(self._vl["lv_col"])
+            key_col  = self._col_idx_from_var(self._vl["key_col"])
+            mode     = self._vl["match_mode"].get()
+            not_f    = self._vl["not_found"].get()
+
+            # 获取选中的返回列
+            sel = list(self._vl["ret_lb"].curselection())
+            if not sel:
+                raise ValueError("请至少选择一个返回列")
+            ret_cols = [int(self._vl["ret_lb"].get(i).split(":")[0]) for i in sel]
+
+            # 取查找值列
+            lv_list = [str(r[lv_col]) if lv_col < len(r) else "" for r in lv_rows[1:]]
+
+            results = engine.vlookup(lv_list, tbl_rows, key_col, ret_cols, mode, not_f)
+
+            tbl_hdr  = tbl_rows[0] if tbl_rows else []
+            ret_hdrs = [tbl_hdr[c] if c < len(tbl_hdr) else f"列{c}" for c in ret_cols]
+            lv_hdr   = (lv_rows[0][lv_col] if lv_rows and lv_col < len(lv_rows[0]) else "查找值")
+            headers  = [lv_hdr] + ret_hdrs + ["匹配状态"]
+
+            out_rows = []
+            for r in results:
+                row = [r["__lookup_value__"]]
+                row += [r.get(f"col_{c}", not_f) for c in ret_cols]
+                row += [r["__status__"]]
+                out_rows.append(row)
+            return headers, out_rows, len(headers) - 1
+
+        elif fname == "XLOOKUP":
+            lv_rows     = self._get_source_rows(self._xl["lv_src"])
+            search_rows = self._get_source_rows(self._xl["search_src"])
+            return_rows = self._get_source_rows(self._xl["return_src"])
+            lv_col      = self._col_idx_from_var(self._xl["lv_col"])
+            search_col  = self._col_idx_from_var(self._xl["search_col"])
+            mode        = self._xl["match_mode"].get()
+            not_f       = self._xl["not_found"].get()
+
+            sel = list(self._xl["ret_lb"].curselection())
+            if not sel:
+                raise ValueError("请至少选择一个返回列")
+            ret_cols = [int(self._xl["ret_lb"].get(i).split(":")[0]) for i in sel]
+            lv_list  = [str(r[lv_col]) if lv_col < len(r) else "" for r in lv_rows[1:]]
+
+            results  = engine.xlookup(lv_list, search_rows, search_col,
+                                      return_rows, ret_cols, mode, not_f)
+            ret_hdr  = return_rows[0] if return_rows else []
+            ret_hdrs = [ret_hdr[c] if c < len(ret_hdr) else f"列{c}" for c in ret_cols]
+            lv_hdr   = lv_rows[0][lv_col] if lv_rows and lv_col < len(lv_rows[0]) else "查找值"
+            headers  = [lv_hdr] + ret_hdrs + ["匹配状态"]
+
+            out_rows = []
+            for r in results:
+                row = [r["__lookup_value__"]]
+                row += [r.get(f"col_{c}", not_f) for c in ret_cols]
+                row += [r["__status__"]]
+                out_rows.append(row)
+            return headers, out_rows, len(headers) - 1
+
+        elif fname == "INDEX/MATCH":
+            lv_rows     = self._get_source_rows(self._im["lv_src"])
+            match_rows  = self._get_source_rows(self._im["match_src"])
+            index_rows  = self._get_source_rows(self._im["index_src"])
+            lv_col      = self._col_idx_from_var(self._im["lv_col"])
+            match_col   = self._col_idx_from_var(self._im["match_col"])
+            index_col   = self._col_idx_from_var(self._im["index_col"])
+            mode        = self._im["match_mode"].get()
+            not_f       = self._im["not_found"].get()
+
+            lv_list  = [str(r[lv_col]) if lv_col < len(r) else "" for r in lv_rows[1:]]
+            results  = engine.index_match(lv_list, match_rows, match_col,
+                                          index_rows, index_col, mode, not_f)
+            idx_hdr  = index_rows[0] if index_rows else []
+            ret_name = idx_hdr[index_col] if index_col < len(idx_hdr) else f"列{index_col}"
+            lv_hdr   = lv_rows[0][lv_col] if lv_rows and lv_col < len(lv_rows[0]) else "查找值"
+            headers  = [lv_hdr, ret_name, "匹配行号", "匹配状态"]
+
+            out_rows = [[r["__lookup_value__"], r["result"],
+                         str(r.get("_row_idx", "")), r["__status__"]]
+                        for r in results]
+            return headers, out_rows, 3
+
+        elif fname == "SUMIF":
+            tbl_rows     = self._get_source_rows(self._si["tbl_src"])
+            criteria_col = self._col_idx_from_var(self._si["criteria_col"])
+            sum_col      = self._col_idx_from_var(self._si["sum_col"])
+            criteria     = self._si["criteria"].get().strip()
+            mode         = self._si["match_mode"].get()
+
+            if not criteria:
+                raise ValueError("请填写条件值")
+
+            result    = engine.sumif(tbl_rows, criteria_col, criteria, sum_col, mode)
+            tbl_hdr   = tbl_rows[0] if tbl_rows else []
+            sum_name  = tbl_hdr[sum_col] if sum_col < len(tbl_hdr) else f"列{sum_col}"
+            crit_name = tbl_hdr[criteria_col] if criteria_col < len(tbl_hdr) else f"列{criteria_col}"
+
+            # 汇总行 + 明细行
+            headers  = [crit_name, sum_name] + [h for h in tbl_hdr if h != sum_name and h != crit_name]
+            sum_row  = [f"[合计]  条件: {criteria}", str(result["sum"])] + [""]*(len(headers)-2)
+            cnt_row  = [f"[匹配行数: {result['count']}]", ""] + [""]*(len(headers)-2)
+            out_rows = [sum_row, cnt_row]
+            for r in result["matched_rows"]:
+                padded = r + [""] * (len(headers) - len(r))
+                out_rows.append([padded[criteria_col], padded[sum_col]] +
+                                 [v for ci, v in enumerate(padded) if ci != criteria_col and ci != sum_col])
+            return headers, out_rows, None
+
+        elif fname == "COUNTIF":
+            tbl_rows     = self._get_source_rows(self._ci["tbl_src"])
+            criteria_col = self._col_idx_from_var(self._ci["criteria_col"])
+            criteria     = self._ci["criteria"].get().strip()
+            mode         = self._ci["match_mode"].get()
+
+            if not criteria:
+                raise ValueError("请填写条件值")
+
+            result    = engine.countif(tbl_rows, criteria_col, criteria, mode)
+            tbl_hdr   = tbl_rows[0] if tbl_rows else []
+            crit_name = tbl_hdr[criteria_col] if criteria_col < len(tbl_hdr) else f"列{criteria_col}"
+            headers   = tbl_hdr if tbl_hdr else [f"列{i}" for i in range(
+                max(len(r) for r in result["matched_rows"]) if result["matched_rows"] else 1)]
+            sum_row   = [f"[COUNTIF 结果: {result['count']}  条件: {crit_name}={criteria}]"]
+            sum_row  += [""] * (len(headers) - 1)
+            out_rows  = [sum_row] + [r + [""]*(len(headers)-len(r)) for r in result["matched_rows"]]
+            return headers, out_rows, None
+
+        elif fname == "SUMIFS":
+            tbl_rows = self._get_source_rows(self._sifs["tbl_src"])
+            sum_col  = self._col_idx_from_var(self._sifs["sum_col"])
+            conds    = []
+            for i in range(4):
+                crit = self._sifs[f"cond{i}_crit"].get().strip()
+                if not crit:
+                    continue
+                col  = self._col_idx_from_var(self._sifs[f"cond{i}_col"])
+                mode = self._sifs[f"cond{i}_mode"].get()
+                conds.append({"col": col, "criteria": crit, "mode": mode})
+            if not conds:
+                raise ValueError("请至少填写一个条件")
+
+            result   = engine.sumifs(tbl_rows, sum_col, conds)
+            tbl_hdr  = tbl_rows[0] if tbl_rows else []
+            headers  = tbl_hdr if tbl_hdr else [f"列{i}" for i in range(
+                max(len(r) for r in result["matched_rows"]) if result["matched_rows"] else 1)]
+            cond_str = "  &  ".join(f"条件{i+1}={c['criteria']}" for i, c in enumerate(conds))
+            sum_row  = [f"[SUMIFS 合计: {result['sum']}  匹配行: {result['count']}  {cond_str}]"]
+            sum_row += [""] * (len(headers) - 1)
+            out_rows = [sum_row] + [r + [""]*(len(headers)-len(r)) for r in result["matched_rows"]]
+            return headers, out_rows, None
+
+        raise ValueError(f"未知函数类型: {fname}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GUI 面板 3 — 结果预览
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ResultsPanel(tk.Frame):
+    """显示函数执行结果，支持搜索过滤和导出"""
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, bg=COLORS["bg"], **kwargs)
+        self._headers: list[str] = []
+        self._rows: list[list[str]] = []
+        self._filtered: list[list[str]] = []
+        self._func_type: str = ""
+        self._status_col: int | None = None
+        self._build_ui()
+
+    def _build_ui(self):
+        # ── 顶栏 ──────────────────────────────────────────────────────────────
+        top = tk.Frame(self, bg=COLORS["bg"])
+        top.pack(fill="x", padx=16, pady=(12, 4))
+
+        tk.Label(top, text="执行结果", bg=COLORS["bg"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
+
+        self._result_info = tk.Label(top, text="尚未执行任何函数", bg=COLORS["bg"],
+                                     fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 9))
+        self._result_info.pack(side="left", padx=16)
+
+        # 搜索栏
+        search_frame = tk.Frame(top, bg=COLORS["bg"])
+        search_frame.pack(side="right")
+        tk.Label(search_frame, text="搜索:", bg=COLORS["bg"],
+                 fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", self._apply_filter)
+        ttk.Entry(search_frame, textvariable=self._search_var, width=24).pack(
+            side="left", padx=4)
+
+        # ── 状态统计栏 ────────────────────────────────────────────────────────
+        stat_bar = tk.Frame(self, bg=COLORS["bg"])
+        stat_bar.pack(fill="x", padx=16, pady=2)
+
+        self._stat_match   = tk.Label(stat_bar, text="", bg=COLORS["bg"],
+                                       fg=COLORS["success"], font=("Microsoft YaHei UI", 9))
+        self._stat_match.pack(side="left", padx=4)
+        self._stat_nomatch = tk.Label(stat_bar, text="", bg=COLORS["bg"],
+                                       fg=COLORS["error"], font=("Microsoft YaHei UI", 9))
+        self._stat_nomatch.pack(side="left", padx=4)
+
+        # ── 结果表格 ──────────────────────────────────────────────────────────
+        tbl_card = make_card(self)
+        tbl_card.pack(fill="both", expand=True, padx=16, pady=4)
+
+        self.tree = ttk.Treeview(tbl_card, show="headings",
+                                  selectmode="extended", height=20)
+        vsb  = ttk.Scrollbar(tbl_card, orient="vertical",   command=self.tree.yview)
+        hsb  = ttk.Scrollbar(tbl_card, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tbl_card.rowconfigure(0, weight=1)
+        tbl_card.columnconfigure(0, weight=1)
+
+        self.tree.tag_configure("match",    background="#E6F7F0")
+        self.tree.tag_configure("nomatch",  background="#FFF1F0")
+        self.tree.tag_configure("even",     background=COLORS["row_even"])
+        self.tree.tag_configure("odd",      background=COLORS["row_odd"])
+        self.tree.tag_configure("summary",  background=COLORS["highlight"],
+                                font=("Microsoft YaHei UI", 9, "bold"))
+
+        # ── 底部工具栏 ────────────────────────────────────────────────────────
+        bot = tk.Frame(self, bg=COLORS["bg"])
+        bot.pack(fill="x", padx=16, pady=8)
+
+        make_label_btn(bot, "↓ 导出 Excel", self._export_excel,
+                       bg=COLORS["success"]).pack(side="left", padx=4)
+        make_label_btn(bot, "⎘ 复制表头+数据", self._copy_tsv,
+                       bg=COLORS["warning"]).pack(side="left", padx=4)
+
+        # 显示模式
+        self._show_all = tk.BooleanVar(value=True)
+        self._show_match = tk.BooleanVar(value=True)
+        self._show_nomatch = tk.BooleanVar(value=True)
+        filter_frame = tk.Frame(bot, bg=COLORS["bg"])
+        filter_frame.pack(side="right")
+        for text, var in [("全部", self._show_all),
+                           ("仅匹配", self._show_match),
+                           ("仅未匹配", self._show_nomatch)]:
+            ttk.Radiobutton(filter_frame, text=text, variable=self._show_all,
+                            value=(text == "全部"),
+                            command=self._apply_filter).pack(side="left", padx=4)
+
+    def show_results(self, headers: list[str], rows: list[list[str]],
+                     func_type: str, status_col: int | None = None):
+        self._headers    = headers
+        self._rows       = rows
+        self._func_type  = func_type
+        self._status_col = status_col
+        self._apply_filter()
+
+        total   = len(rows)
+        matched = sum(1 for r in rows if status_col is not None
+                      and status_col < len(r) and r[status_col] == "MATCH")
+        self._result_info.config(
+            text=f"函数: {func_type}  |  共 {total} 行"
+        )
+        if status_col is not None:
+            self._stat_match.config(  text=f"匹配: {matched}")
+            self._stat_nomatch.config(text=f"未匹配: {total - matched}")
+        else:
+            self._stat_match.config(  text="")
+            self._stat_nomatch.config(text="")
+
+    def _apply_filter(self, *_):
+        kw   = self._search_var.get().strip().lower()
+        rows = self._rows
+
+        if kw:
+            rows = [r for r in rows if any(kw in str(v).lower() for v in r)]
+
+        self._filtered = rows
+        self._render_table()
+
+    def _render_table(self):
+        self.tree.delete(*self.tree.get_children())
+        if not self._headers:
+            return
+
+        col_ids = [f"c{i}" for i in range(len(self._headers))]
+        self.tree["columns"] = col_ids
+        for ci, (cid, h) in enumerate(zip(col_ids, self._headers)):
+            self.tree.heading(cid, text=h, anchor="w")
+            self.tree.column(cid, width=120, minwidth=60, anchor="w")
+
+        for ri, row in enumerate(self._filtered):
+            padded = list(row) + [""] * (len(self._headers) - len(row))
+
+            if self._status_col is not None and self._status_col < len(padded):
+                status = padded[self._status_col]
+                tag    = "match" if status == "MATCH" else "nomatch"
+            elif ri == 0 and padded and str(padded[0]).startswith("["):
+                tag = "summary"
+            else:
+                tag = "even" if ri % 2 == 0 else "odd"
+
+            self.tree.insert("", "end", values=padded, tags=(tag,))
+
+    def _export_excel(self):
+        if not self._rows:
+            messagebox.showinfo("提示", "暂无结果可导出", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel 文件", "*.xlsx")],
+            initialfile=f"函数结果_{self._func_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            ExcelExporter.export_results(path, self._headers, self._rows, self._status_col)
+            messagebox.showinfo("导出成功", f"已保存至:\n{path}", parent=self)
+        except Exception as ex:
+            messagebox.showerror("导出失败", str(ex), parent=self)
+
+    def _copy_tsv(self):
+        if not self._rows:
+            return
+        lines = ["\t".join(self._headers)]
+        lines += ["\t".join(str(v) for v in r) for r in self._filtered]
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+        messagebox.showinfo("已复制", f"已复制 {len(self._filtered)} 行到剪贴板", parent=self)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GUI 面板 4 — API 设置
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SettingsPanel(tk.Frame):
+
+    def __init__(self, master, cache: DataCache, api: FeishuAPIClient, **kwargs):
+        super().__init__(master, bg=COLORS["bg"], **kwargs)
+        self.cache = cache
+        self.api   = api
+        self._build_ui()
+        self._load_config()
+
+    def _build_ui(self):
+        tk.Label(self, text="API 设置", bg=COLORS["bg"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 13, "bold")).pack(
+                     anchor="w", padx=16, pady=(12, 4))
+
+        card = make_card(self)
+        card.pack(fill="x", padx=16, pady=8)
+
+        fields = [
+            ("内网代理地址", "proxy_url",
+             "默认: https://mcenter.huaqin.com  (留空使用默认值)"),
+            ("App ID",       "app_id",
+             "默认: cli_a96ac38049f8d0e5"),
+            ("User ID",      "user_id",
+             "企业内网用户 ID（工号）"),
+            ("Access Token", "access_token",
+             "飞书开放平台 user_access_token（使用官方 API 时填写）"),
+        ]
+
+        self._vars: dict[str, tk.StringVar] = {}
+        for ri, (label, key, hint) in enumerate(fields):
+            tk.Label(card, text=label, bg=COLORS["card"], fg=COLORS["text"],
+                     font=("Microsoft YaHei UI", 9, "bold"),
+                     width=14, anchor="e").grid(row=ri*2, column=0, padx=(12, 4), pady=(10, 0))
+            var = tk.StringVar()
+            self._vars[key] = var
+            show = "*" if key == "access_token" else ""
+            ttk.Entry(card, textvariable=var, width=56, show=show).grid(
+                row=ri*2, column=1, padx=4, pady=(10, 0), sticky="ew")
+            tk.Label(card, text=hint, bg=COLORS["card"], fg=COLORS["text_sub"],
+                     font=("Microsoft YaHei UI", 7)).grid(
+                         row=ri*2+1, column=1, padx=4, sticky="w")
+        card.columnconfigure(1, weight=1)
+
+        tk.Label(self, text="关于", bg=COLORS["bg"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 10, "bold")).pack(
+                     anchor="w", padx=16, pady=(16, 4))
+        about_card = make_card(self)
+        about_card.pack(fill="x", padx=16, pady=4)
+        tk.Label(about_card,
+                 text=f"{APP_NAME}  v{APP_VERSION}\n\n"
+                      "基于飞书表格 API 的可视化函数面板\n"
+                      "支持 VLOOKUP / XLOOKUP / INDEX-MATCH / SUMIF / COUNTIF / SUMIFS\n"
+                      "数据本地缓存于 feishu_vlookup_data/cache.db",
+                 bg=COLORS["card"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 9), justify="left").pack(
+                     padx=16, pady=12)
+
+        btn_row = tk.Frame(self, bg=COLORS["bg"])
+        btn_row.pack(pady=8)
+        make_label_btn(btn_row, "保存设置", self._save_config).pack(side="left", padx=6)
+        make_label_btn(btn_row, "恢复默认", self._reset_defaults,
+                       bg=COLORS["text_sub"]).pack(side="left", padx=6)
+
+    def _load_config(self):
+        cfg = self.cache.load_api_config()
+        self._vars["proxy_url"].set(    cfg.get("proxy_url",     ""))
+        self._vars["app_id"].set(       cfg.get("app_id",        ""))
+        self._vars["user_id"].set(      cfg.get("user_id",       ""))
+        self._vars["access_token"].set( cfg.get("access_token",  ""))
+        self._apply_to_api()
+
+    def _save_config(self):
+        self.cache.save_api_config({k: v.get() for k, v in self._vars.items()})
+        self._apply_to_api()
+        messagebox.showinfo("已保存", "设置已保存", parent=self)
+
+    def _reset_defaults(self):
+        self._vars["proxy_url"].set("")
+        self._vars["app_id"].set("")
+        self._vars["user_id"].set("")
+        self._vars["access_token"].set("")
+        self._apply_to_api()
+
+    def _apply_to_api(self):
+        self.api.base_url      = self._vars["proxy_url"].get()    or FeishuAPIClient.DEFAULT_PROXY
+        self.api.app_id        = self._vars["app_id"].get()       or "cli_a96ac38049f8d0e5"
+        self.api.user_id       = self._vars["user_id"].get()
+        self.api.access_token  = self._vars["access_token"].get()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 主应用
+# ═════════════════════════════════════════════════════════════════════════════
+
+class FeishuFormulaApp(tk.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME}  v{APP_VERSION}")
+        self.geometry("1180x820")
+        self.minsize(900, 640)
+        self.configure(bg=COLORS["bg"])
+
+        self._setup_styles()
+
+        self.cache = DataCache()
+        self.api   = FeishuAPIClient()
+
+        self._build_ui()
+        self._load_api_config()
+
+    def _setup_styles(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("TNotebook",          background=COLORS["bg"],       borderwidth=0)
+        style.configure("TNotebook.Tab",       background=COLORS["border"],
+                        foreground=COLORS["text"], padding=(14, 6),
+                        font=("Microsoft YaHei UI", 9))
+        style.map("TNotebook.Tab",
+                  background=[("selected", COLORS["primary"])],
+                  foreground=[("selected", "white")])
+        style.configure("Treeview",            background=COLORS["card"],
+                        fieldbackground=COLORS["card"],
+                        foreground=COLORS["text"], rowheight=24,
+                        font=("Microsoft YaHei UI", 8))
+        style.configure("Treeview.Heading",    background=COLORS["bg"],
+                        foreground=COLORS["text_sub"],
+                        font=("Microsoft YaHei UI", 8, "bold"))
+        style.map("Treeview", background=[("selected", COLORS["highlight"])],
+                  foreground=[("selected", COLORS["primary"])])
+        style.configure("TEntry",             padding=4,
+                        font=("Microsoft YaHei UI", 9))
+        style.configure("TCombobox",          padding=4,
+                        font=("Microsoft YaHei UI", 9))
+        style.configure("TScrollbar",         background=COLORS["border"],
+                        troughcolor=COLORS["bg"], width=8)
+
+    def _build_ui(self):
+        # ── 标题栏 ────────────────────────────────────────────────────────────
+        header = tk.Frame(self, bg=COLORS["primary"], height=50)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text=f"  {APP_NAME}", bg=COLORS["primary"],
+                 fg="white", font=("Microsoft YaHei UI", 12, "bold")).pack(
+                     side="left", padx=8, pady=12)
+        tk.Label(header, text=f"v{APP_VERSION}", bg=COLORS["primary"],
+                 fg="#B0C4FF", font=("Microsoft YaHei UI", 8)).pack(side="left")
+
+        # 快速说明
+        quick_tips = (
+            "① 数据源 — 添加飞书表格并同步    "
+            "② 函数构建 — 选择函数类型并配置参数    "
+            "③ 查看结果 — 预览、搜索、导出 Excel"
+        )
+        tk.Label(header, text=quick_tips, bg=COLORS["primary"],
+                 fg="#B0C4FF", font=("Microsoft YaHei UI", 8)).pack(side="right", padx=16)
+
+        # ── 选项卡 ────────────────────────────────────────────────────────────
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=0, pady=0)
+
+        self.results_panel = ResultsPanel(self.nb)
+        self.builder_panel = FunctionBuilderPanel(
+            self.nb, self.cache,
+            on_results=self._on_results
+        )
+        self.source_panel = DataSourcePanel(
+            self.nb, self.cache, self.api,
+            on_sources_changed=self._on_sources_changed
+        )
+        self.settings_panel = SettingsPanel(self.nb, self.cache, self.api)
+
+        self.nb.add(self.source_panel,   text="  数据源管理  ")
+        self.nb.add(self.builder_panel,  text="  函数构建器  ")
+        self.nb.add(self.results_panel,  text="  执行结果    ")
+        self.nb.add(self.settings_panel, text="  API 设置    ")
+
+    def _on_results(self, headers, rows, func_type):
+        # 推断 status 列索引
+        status_col = None
+        for ci, h in enumerate(headers):
+            if h in ("匹配状态", "__status__"):
+                status_col = ci
+                break
+        self.results_panel.show_results(headers, rows, func_type, status_col)
+        self.nb.select(2)  # 自动跳到结果页
+
+    def _on_sources_changed(self):
+        self.builder_panel.reload_sources()
+
+    def _load_api_config(self):
+        cfg = self.cache.load_api_config()
+        if cfg:
+            self.api.base_url     = cfg.get("proxy_url",    "") or FeishuAPIClient.DEFAULT_PROXY
+            self.api.app_id       = cfg.get("app_id",       "") or "cli_a96ac38049f8d0e5"
+            self.api.user_id      = cfg.get("user_id",      "")
+            self.api.access_token = cfg.get("access_token", "")
+
+
+# ─── 入口 ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    app = FeishuFormulaApp()
+    app.mainloop()
