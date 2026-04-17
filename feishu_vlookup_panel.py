@@ -172,6 +172,62 @@ class FeishuAPIClient:
             data = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows)
             return data.get("data", {}).get("values", [])
 
+    # ── 写入 ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _col_letter(n: int) -> str:
+        """0-based 列索引 → Excel 列字母 (0→A, 25→Z, 26→AA …)"""
+        result = ""
+        n += 1
+        while n:
+            n, rem = divmod(n - 1, 26)
+            result = chr(65 + rem) + result
+        return result
+
+    def write_values_proxy(self, token: str, sheet_id: str,
+                           values: list[list],
+                           start_row: int = 0, start_col: int = 0) -> dict:
+        """内网代理写入（行列均 0-based，0 行为表头行）"""
+        url  = f"{self.base_url}/fs/sheet/v1/setSheetsValue"
+        body = {
+            "spreadsheetToken": token,
+            "sheetId":          sheet_id,
+            "startRow":         start_row,
+            "startCol":         start_col,
+            "values":           values,
+        }
+        r = requests.post(url, json=body, headers=self._proxy_headers(), timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    def write_values_open(self, token: str, sheet_id: str,
+                          values: list[list],
+                          start_row: int = 0, start_col: int = 0) -> dict:
+        """飞书开放平台写入"""
+        if not values:
+            return {}
+        end_row = start_row + len(values)
+        end_col = start_col + max((len(r) for r in values), default=1)
+        rng = (f"{sheet_id}!"
+               f"{self._col_letter(start_col)}{start_row + 1}:"
+               f"{self._col_letter(end_col - 1)}{end_row}")
+        url  = (f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets"
+                f"/{token}/values")
+        body = {"valueRange": {"range": rng, "values": values}}
+        r = requests.put(url, json=body, headers=self._open_headers(), timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    def write_values(self, token: str, sheet_id: str,
+                     values: list[list],
+                     start_row: int = 0, start_col: int = 0,
+                     use_open_api: bool = False) -> dict:
+        """统一写入接口（start_row/start_col 均 0-based）"""
+        if use_open_api:
+            return self.write_values_open(token, sheet_id, values, start_row, start_col)
+        else:
+            return self.write_values_proxy(token, sheet_id, values, start_row, start_col)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 数据缓存层
@@ -1661,10 +1717,13 @@ class FunctionBuilderPanel(tk.Frame):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class ResultsPanel(tk.Frame):
-    """显示函数执行结果，支持搜索过滤和导出"""
+    """显示函数执行结果，支持搜索过滤、导出和写回飞书"""
 
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, cache: DataCache = None,
+                 api: FeishuAPIClient = None, **kwargs):
         super().__init__(master, bg=COLORS["bg"], **kwargs)
+        self.cache = cache
+        self.api   = api
         self._headers: list[str] = []
         self._rows: list[list[str]] = []
         self._filtered: list[list[str]] = []
@@ -1733,6 +1792,8 @@ class ResultsPanel(tk.Frame):
 
         make_label_btn(bot, "↓ 导出 Excel", self._export_excel,
                        bg=COLORS["success"]).pack(side="left", padx=4)
+        make_label_btn(bot, "↑ 写回飞书", self._open_write_back_dialog,
+                       bg=COLORS["primary"]).pack(side="left", padx=4)
         make_label_btn(bot, "⎘ 复制表头+数据", self._copy_tsv,
                        bg=COLORS["warning"]).pack(side="left", padx=4)
 
@@ -1831,9 +1892,649 @@ class ResultsPanel(tk.Frame):
         self.clipboard_append("\n".join(lines))
         messagebox.showinfo("已复制", f"已复制 {len(self._filtered)} 行到剪贴板", parent=self)
 
+    def _open_write_back_dialog(self):
+        """打开「写回飞书」对话框：选择目标表格和起始位置，写入函数结果"""
+        if not self._rows:
+            messagebox.showinfo("提示", "暂无结果，请先执行函数", parent=self)
+            return
+        if not self.cache or not self.api:
+            messagebox.showwarning("提示", "未配置 cache/api，无法写回", parent=self)
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("写回飞书")
+        dlg.geometry("620x620")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.configure(bg=COLORS["bg"])
+
+        tk.Label(dlg, text="将函数结果写回飞书表格", bg=COLORS["bg"],
+                 fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(16, 4))
+        tk.Label(dlg, text="选择目标数据源（已同步的飞书 Sheet），配置写入起始位置",
+                 bg=COLORS["bg"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 9)).pack(pady=(0, 8))
+
+        cfg_card = make_card(dlg)
+        cfg_card.pack(fill="x", padx=20, pady=4)
+
+        # 目标数据源
+        tk.Label(cfg_card, text="目标数据源", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=12, anchor="e").grid(row=0, column=0, padx=(12, 4), pady=10)
+        sources = self.cache.list_sources()
+        src_names = [f"{s['id']}: {s['name']} [{s['sheet_title'] or s['sheet_id']}]"
+                     for s in sources]
+        tgt_src_var = tk.StringVar()
+        src_cb = ttk.Combobox(cfg_card, textvariable=tgt_src_var,
+                               values=src_names, width=40, state="readonly")
+        src_cb.grid(row=0, column=1, columnspan=2, padx=4, pady=10, sticky="w")
+
+        # 起始行
+        tk.Label(cfg_card, text="起始行(0=表头)", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=12, anchor="e").grid(row=1, column=0, padx=(12, 4), pady=8)
+        start_row_var = tk.StringVar(value="1")
+        ttk.Entry(cfg_card, textvariable=start_row_var, width=8).grid(
+            row=1, column=1, padx=4, sticky="w")
+        tk.Label(cfg_card, text="（1=跳过表头，从第二行开始写）", bg=COLORS["card"],
+                 fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 8)).grid(
+                     row=1, column=2, padx=4, sticky="w")
+
+        # 起始列
+        tk.Label(cfg_card, text="起始列(0=A列)", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=12, anchor="e").grid(row=2, column=0, padx=(12, 4), pady=8)
+        start_col_var = tk.StringVar(value="0")
+        ttk.Entry(cfg_card, textvariable=start_col_var, width=8).grid(
+            row=2, column=1, padx=4, sticky="w")
+        tk.Label(cfg_card, text="（若只需写一列，可配合「写入列选择」使用）",
+                 bg=COLORS["card"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 8)).grid(row=2, column=2, padx=4, sticky="w")
+
+        # 选择写入哪些结果列
+        tk.Label(cfg_card, text="写入列（多选）", bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=12, anchor="e").grid(row=3, column=0, padx=(12, 4), pady=8)
+        col_frame = tk.Frame(cfg_card, bg=COLORS["card"])
+        col_frame.grid(row=3, column=1, columnspan=2, padx=4, pady=8, sticky="w")
+        col_lb = tk.Listbox(col_frame, selectmode="multiple", height=5, width=42)
+        col_sb = ttk.Scrollbar(col_frame, command=col_lb.yview)
+        col_lb.configure(yscrollcommand=col_sb.set)
+        col_lb.pack(side="left")
+        col_sb.pack(side="left", fill="y")
+
+        # 排除状态列，其余均可选
+        writable_cols: list[tuple[int, str]] = []
+        for ci, h in enumerate(self._headers):
+            if h not in ("匹配状态", "__status__"):
+                writable_cols.append((ci, h))
+                col_lb.insert("end", f"{ci}: {h}")
+        # 默认全选
+        col_lb.select_set(0, "end")
+
+        # 是否跳过未匹配行
+        skip_nomatch_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(cfg_card, text="跳过未匹配行（状态=NOT_FOUND）",
+                       variable=skip_nomatch_var,
+                       bg=COLORS["card"], font=("Microsoft YaHei UI", 9)).grid(
+                           row=4, column=0, columnspan=3, padx=12, pady=6, sticky="w")
+
+        cfg_card.columnconfigure(2, weight=1)
+
+        # 预览
+        preview_lbl = tk.Label(dlg, text="写入预览（前 5 行）", bg=COLORS["bg"],
+                               fg=COLORS["text_sub"],
+                               font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=20) if False else None
+        tk.Label(dlg, text="写入预览（前 5 行）", bg=COLORS["bg"],
+                 fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=20, pady=(8, 2))
+
+        prev_frame = make_card(dlg)
+        prev_frame.pack(fill="x", padx=20, pady=2)
+        prev_tv = ttk.Treeview(prev_frame, show="headings", height=5)
+        prev_tv.pack(fill="x", padx=4, pady=4)
+
+        def update_preview(*_):
+            sel_idxs = list(col_lb.curselection())
+            if not sel_idxs:
+                return
+            chosen_cols = [writable_cols[i] for i in sel_idxs]
+            prev_tv["columns"] = [f"c{i}" for i in range(len(chosen_cols))]
+            for ci, (_, h) in enumerate(chosen_cols):
+                prev_tv.heading(f"c{ci}", text=h)
+                prev_tv.column(f"c{ci}", width=100)
+            prev_tv.delete(*prev_tv.get_children())
+            shown = 0
+            for row in self._rows:
+                if self._status_col is not None and self._status_col < len(row):
+                    if skip_nomatch_var.get() and row[self._status_col] == "NOT_FOUND":
+                        continue
+                preview_row = [row[c] if c < len(row) else "" for c, _ in chosen_cols]
+                prev_tv.insert("", "end", values=preview_row)
+                shown += 1
+                if shown >= 5:
+                    break
+
+        col_lb.bind("<<ListboxSelect>>", update_preview)
+        skip_nomatch_var.trace_add("write", update_preview)
+        update_preview()
+
+        # 状态
+        wb_status = tk.StringVar(value="")
+        tk.Label(dlg, textvariable=wb_status, bg=COLORS["bg"],
+                 fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 8),
+                 wraplength=560).pack(pady=4)
+
+        # 按钮
+        btn_row = tk.Frame(dlg, bg=COLORS["bg"])
+        btn_row.pack(pady=8)
+
+        def do_write():
+            tgt = tgt_src_var.get()
+            if not tgt:
+                messagebox.showwarning("提示", "请选择目标数据源", parent=dlg)
+                return
+            try:
+                start_row = int(start_row_var.get().strip())
+                start_col = int(start_col_var.get().strip())
+            except ValueError:
+                messagebox.showwarning("提示", "起始行/列请输入整数", parent=dlg)
+                return
+
+            sel_idxs = list(col_lb.curselection())
+            if not sel_idxs:
+                messagebox.showwarning("提示", "请至少选择一个写入列", parent=dlg)
+                return
+            chosen_cols = [writable_cols[i][0] for i in sel_idxs]
+
+            # 过滤行
+            write_rows = []
+            for row in self._rows:
+                if self._status_col is not None and self._status_col < len(row):
+                    if skip_nomatch_var.get() and row[self._status_col] == "NOT_FOUND":
+                        continue
+                write_rows.append([row[c] if c < len(row) else "" for c in chosen_cols])
+
+            if not write_rows:
+                messagebox.showinfo("提示", "过滤后没有可写入的行", parent=dlg)
+                return
+
+            # 解析目标源
+            try:
+                sid  = int(tgt.split(":")[0])
+                src  = self.cache.get_source(sid)
+            except Exception:
+                messagebox.showerror("错误", "无法解析目标数据源", parent=dlg)
+                return
+
+            wb_status.set(f"正在写入 {len(write_rows)} 行 × {len(chosen_cols)} 列...")
+            dlg.update_idletasks()
+
+            def worker():
+                try:
+                    self.api.write_values(
+                        src["token"], src["sheet_id"], write_rows,
+                        start_row=start_row, start_col=start_col,
+                        use_open_api=bool(src["use_open_api"]),
+                    )
+                    dlg.after(0, lambda: [
+                        wb_status.set(f"写入成功！共 {len(write_rows)} 行"),
+                        messagebox.showinfo("成功",
+                                            f"已写入 {len(write_rows)} 行到\n{src['name']}",
+                                            parent=dlg),
+                    ])
+                except Exception as ex:
+                    dlg.after(0, lambda e=ex: [
+                        wb_status.set(f"写入失败: {e}"),
+                        messagebox.showerror("写入失败", str(e), parent=dlg),
+                    ])
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        make_label_btn(btn_row, "↑ 执行写回", do_write,
+                       padx=16, pady=6, font_size=10).pack(side="left", padx=6)
+        make_label_btn(btn_row, "取消", dlg.destroy,
+                       bg=COLORS["text_sub"]).pack(side="left", padx=6)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
-# GUI 面板 4 — API 设置
+# GUI 面板 4 — 在线编辑器
+# ═════════════════════════════════════════════════════════════════════════════
+
+class OnlineEditorPanel(tk.Frame):
+    """
+    在线表格编辑器
+    - 从缓存（或直接拉取）加载飞书表格数据到可编辑网格
+    - 双击单元格进行编辑，修改后高亮为蓝色
+    - "保存到飞书"按钮批量写回所有脏单元格
+    - 支持在指定列粘贴一列数据（常用于把 VLOOKUP 结果填到目标列）
+    """
+
+    def __init__(self, master, cache: DataCache, api: FeishuAPIClient,
+                 **kwargs):
+        super().__init__(master, bg=COLORS["bg"], **kwargs)
+        self.cache = cache
+        self.api   = api
+
+        self._source: dict | None = None   # 当前加载的数据源
+        self._data:   list[list[str]] = [] # 包含表头的全量数据（本地副本）
+        self._dirty:  dict[tuple[int,int], str] = {}  # {(row_idx, col_idx): new_val}
+        self._col_count = 0
+        self._editing_entry: tk.Entry | None = None
+
+        self._build_ui()
+        self._reload_source_list()
+
+    # ── UI 构建 ───────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # 顶栏：数据源选择 + 操作按钮
+        top = tk.Frame(self, bg=COLORS["bg"])
+        top.pack(fill="x", padx=16, pady=(12, 4))
+
+        tk.Label(top, text="在线编辑", bg=COLORS["bg"],
+                 fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
+
+        ctrl = tk.Frame(top, bg=COLORS["bg"])
+        ctrl.pack(side="right")
+
+        tk.Label(ctrl, text="数据源:", bg=COLORS["bg"],
+                 fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self._src_var = tk.StringVar()
+        self._src_cb = ttk.Combobox(ctrl, textvariable=self._src_var,
+                                     width=32, state="readonly")
+        self._src_cb.pack(side="left", padx=4)
+        self._src_cb.bind("<<ComboboxSelected>>", self._load_source)
+
+        make_label_btn(ctrl, "↻ 重新拉取", self._pull_from_feishu,
+                       bg=COLORS["success"]).pack(side="left", padx=4)
+
+        # 状态行
+        status_bar = tk.Frame(self, bg=COLORS["bg"])
+        status_bar.pack(fill="x", padx=16, pady=2)
+        self._status_var = tk.StringVar(value="请选择数据源")
+        tk.Label(status_bar, textvariable=self._status_var,
+                 bg=COLORS["bg"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 8)).pack(side="left")
+        self._dirty_var = tk.StringVar(value="")
+        self._dirty_lbl = tk.Label(status_bar, textvariable=self._dirty_var,
+                                    bg=COLORS["bg"], fg=COLORS["warning"],
+                                    font=("Microsoft YaHei UI", 8, "bold"))
+        self._dirty_lbl.pack(side="left", padx=12)
+
+        # 编辑提示
+        tk.Label(status_bar,
+                 text="双击单元格编辑  |  Enter/Tab 确认  |  Esc 取消",
+                 bg=COLORS["bg"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 8)).pack(side="right")
+
+        # 表格
+        tbl_card = make_card(self)
+        tbl_card.pack(fill="both", expand=True, padx=16, pady=4)
+
+        self.tree = ttk.Treeview(tbl_card, show="headings",
+                                  selectmode="browse", height=24)
+        vsb  = ttk.Scrollbar(tbl_card, orient="vertical",   command=self.tree.yview)
+        hsb  = ttk.Scrollbar(tbl_card, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tbl_card.rowconfigure(0, weight=1)
+        tbl_card.columnconfigure(0, weight=1)
+
+        self.tree.tag_configure("header_row", background=COLORS["primary"],
+                                font=("Microsoft YaHei UI", 8, "bold"))
+        self.tree.tag_configure("even",   background=COLORS["row_even"])
+        self.tree.tag_configure("odd",    background=COLORS["row_odd"])
+        self.tree.tag_configure("dirty",  background="#FFF3CD",
+                                foreground="#856404")
+
+        self.tree.bind("<Double-1>", self._on_dblclick)
+        self.tree.bind("<Button-1>", self._commit_editing)
+
+        # 底部操作栏
+        bot = tk.Frame(self, bg=COLORS["bg"])
+        bot.pack(fill="x", padx=16, pady=8)
+
+        make_label_btn(bot, "↑ 保存修改到飞书", self._save_dirty,
+                       bg=COLORS["success"], padx=16, pady=6,
+                       font_size=10).pack(side="left", padx=4)
+        make_label_btn(bot, "✗ 撤销所有修改", self._discard_dirty,
+                       bg=COLORS["error"]).pack(side="left", padx=4)
+
+        # 粘贴列工具
+        paste_sep = tk.Frame(bot, bg=COLORS["border"], width=1)
+        paste_sep.pack(side="left", fill="y", padx=8)
+
+        tk.Label(bot, text="粘贴一列到列号:",
+                 bg=COLORS["bg"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self._paste_col_var = tk.StringVar(value="0")
+        ttk.Entry(bot, textvariable=self._paste_col_var, width=5).pack(
+            side="left", padx=4)
+        tk.Label(bot, text="起始行(含表头=0):",
+                 bg=COLORS["bg"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(8, 0))
+        self._paste_row_var = tk.StringVar(value="1")
+        ttk.Entry(bot, textvariable=self._paste_row_var, width=5).pack(
+            side="left", padx=4)
+        make_label_btn(bot, "粘贴剪贴板列", self._paste_col_from_clipboard,
+                       bg=COLORS["warning"]).pack(side="left", padx=4)
+
+    # ── 数据源 ────────────────────────────────────────────────────────────────
+
+    def _reload_source_list(self):
+        sources = self.cache.list_sources()
+        names   = [f"{s['id']}: {s['name']} [{s['sheet_title'] or s['sheet_id']}]"
+                   for s in sources]
+        self._src_cb["values"] = names
+
+    def _source_id_from_choice(self) -> int | None:
+        v = self._src_var.get()
+        try:
+            return int(v.split(":")[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _load_source(self, event=None):
+        sid = self._source_id_from_choice()
+        if sid is None:
+            return
+        src = self.cache.get_source(sid)
+        if not src:
+            return
+        if not src.get("synced_at"):
+            if messagebox.askyesno("未同步", "该数据源尚未同步，立即从飞书拉取？",
+                                   parent=self):
+                self._pull_from_feishu()
+            return
+        self._source = src
+        rows = self.cache.get_all_rows(sid)
+        self._data   = [list(r) for r in rows]
+        self._dirty  = {}
+        self._render_grid()
+        self._status_var.set(
+            f"已加载: {src['name']}  |  {len(rows)} 行 × {src['col_count']} 列  "
+            f"|  上次同步: {src['synced_at']}")
+        self._dirty_var.set("")
+
+    def _pull_from_feishu(self):
+        sid = self._source_id_from_choice()
+        if sid is None:
+            messagebox.showinfo("提示", "请先选择数据源", parent=self)
+            return
+        src = self.cache.get_source(sid)
+        if not src:
+            return
+        self._status_var.set("正在从飞书拉取数据...")
+        self.update_idletasks()
+
+        def worker():
+            try:
+                rows = self.api.fetch_values(
+                    src["token"], src["sheet_id"],
+                    use_open_api=bool(src["use_open_api"])
+                )
+                self.cache.store_rows(sid, rows)
+                self.after(0, self._load_source)
+                self.after(0, lambda: self._status_var.set(
+                    f"拉取完成: {len(rows)} 行"))
+            except Exception as ex:
+                self.after(0, lambda e=ex: [
+                    self._status_var.set(f"拉取失败: {e}"),
+                    messagebox.showerror("拉取失败", str(e), parent=self),
+                ])
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ── 渲染网格 ──────────────────────────────────────────────────────────────
+
+    def _render_grid(self):
+        self.tree.delete(*self.tree.get_children())
+        if not self._data:
+            return
+        headers = self._data[0]
+        self._col_count = len(headers)
+
+        col_ids = [f"c{i}" for i in range(len(headers))]
+        self.tree["columns"] = col_ids
+        for ci, (cid, h) in enumerate(zip(col_ids, headers)):
+            self.tree.heading(cid, text=f"{ci} | {h}", anchor="w")
+            self.tree.column(cid, width=120, minwidth=60, anchor="w")
+
+        # 存储 item_id -> row_idx 映射（用于编辑定位）
+        self._iid_to_row: dict[str, int] = {}
+
+        for ri, row in enumerate(self._data[1:], start=1):
+            padded = list(row) + [""] * (len(headers) - len(row))
+            # 检查该行是否有脏单元格
+            row_dirty = any((ri, ci) in self._dirty for ci in range(len(headers)))
+            tag = "dirty" if row_dirty else ("even" if ri % 2 == 0 else "odd")
+            iid = self.tree.insert("", "end", values=padded, tags=(tag,))
+            self._iid_to_row[iid] = ri
+
+    def _refresh_row_tag(self, iid: str):
+        ri = self._iid_to_row.get(iid)
+        if ri is None:
+            return
+        row_dirty = any((ri, ci) in self._dirty for ci in range(self._col_count))
+        tag = "dirty" if row_dirty else ("even" if ri % 2 == 0 else "odd")
+        self.tree.item(iid, tags=(tag,))
+
+    # ── 单元格双击编辑 ────────────────────────────────────────────────────────
+
+    def _commit_editing(self, event=None):
+        """点击其他区域时提交当前正在编辑的 Entry"""
+        if self._editing_entry and self._editing_entry.winfo_exists():
+            self._editing_entry.event_generate("<Return>")
+
+    def _on_dblclick(self, event):
+        # 先提交任何正在进行的编辑
+        self._commit_editing()
+
+        item = self.tree.identify_row(event.y)
+        col  = self.tree.identify_column(event.x)
+        if not item or not col:
+            return
+        bbox = self.tree.bbox(item, col)
+        if not bbox:
+            return
+
+        x, y, w, h = bbox
+        col_idx = int(col[1:]) - 1   # "#1" → 0
+        row_idx = self._iid_to_row.get(item)
+        if row_idx is None:
+            return
+
+        # 确保本地数据足够长
+        while len(self._data) <= row_idx:
+            self._data.append([""] * self._col_count)
+        while len(self._data[row_idx]) <= col_idx:
+            self._data[row_idx].append("")
+
+        cur_val = self._data[row_idx][col_idx]
+
+        var   = tk.StringVar(value=cur_val)
+        entry = tk.Entry(self.tree, textvariable=var,
+                         bg="white", fg=COLORS["primary"],
+                         insertbackground=COLORS["primary"],
+                         relief="solid", bd=1,
+                         font=("Microsoft YaHei UI", 9))
+        entry.place(x=x, y=y, width=max(w, 80), height=h)
+        entry.focus_set()
+        entry.select_range(0, "end")
+        self._editing_entry = entry
+
+        def commit(e=None):
+            if not entry.winfo_exists():
+                return
+            new_val = var.get()
+            old_val = self._data[row_idx][col_idx]
+
+            if new_val != old_val:
+                self._data[row_idx][col_idx] = new_val
+                self._dirty[(row_idx, col_idx)] = new_val
+                # 更新 Treeview 显示
+                vals = list(self.tree.item(item, "values"))
+                while len(vals) <= col_idx:
+                    vals.append("")
+                vals[col_idx] = new_val
+                self.tree.item(item, values=vals)
+                self._refresh_row_tag(item)
+                self._dirty_var.set(f"● 未保存修改: {len(self._dirty)} 个单元格")
+            entry.destroy()
+            self._editing_entry = None
+
+        def cancel(e=None):
+            if entry.winfo_exists():
+                entry.destroy()
+            self._editing_entry = None
+
+        entry.bind("<Return>", commit)
+        entry.bind("<Tab>",    commit)
+        entry.bind("<Escape>", cancel)
+        # 注意：不绑定 FocusOut，否则点别处时会与 _commit_editing 冲突
+
+    # ── 保存 / 撤销 ──────────────────────────────────────────────────────────
+
+    def _save_dirty(self):
+        if not self._dirty:
+            messagebox.showinfo("提示", "没有需要保存的修改", parent=self)
+            return
+        if not self._source:
+            messagebox.showwarning("提示", "未加载数据源", parent=self)
+            return
+
+        # 将所有脏单元格按行分组，构建最小矩形区域逐行写入
+        rows_to_write: dict[int, dict[int, str]] = {}
+        for (ri, ci), val in self._dirty.items():
+            rows_to_write.setdefault(ri, {})[ci] = val
+
+        src      = self._source
+        token    = src["token"]
+        sheet_id = src["sheet_id"]
+        use_open = bool(src["use_open_api"])
+
+        total = len(rows_to_write)
+        self._status_var.set(f"正在写入 {total} 行到飞书...")
+        self.update_idletasks()
+
+        def worker():
+            errors = []
+            for ri, col_dict in rows_to_write.items():
+                col_idxs = sorted(col_dict.keys())
+                start_c  = col_idxs[0]
+                end_c    = col_idxs[-1] + 1
+                row_vals = [col_dict.get(ci, self._data[ri][ci] if ci < len(self._data[ri]) else "")
+                            for ci in range(start_c, end_c)]
+                try:
+                    self.api.write_values(
+                        token, sheet_id, [row_vals],
+                        start_row=ri, start_col=start_c,
+                        use_open_api=use_open,
+                    )
+                except Exception as ex:
+                    errors.append(f"行 {ri}: {ex}")
+
+            def done():
+                if errors:
+                    messagebox.showerror(
+                        "部分写入失败",
+                        f"成功 {total - len(errors)} 行，失败 {len(errors)} 行:\n"
+                        + "\n".join(errors[:5]),
+                        parent=self,
+                    )
+                else:
+                    self._dirty.clear()
+                    self._dirty_var.set("")
+                    # 刷新 tag
+                    for iid in self.tree.get_children():
+                        ri2 = self._iid_to_row.get(iid)
+                        if ri2 is not None:
+                            tag = "even" if ri2 % 2 == 0 else "odd"
+                            self.tree.item(iid, tags=(tag,))
+                    messagebox.showinfo("保存成功",
+                                        f"已写入 {total} 行到飞书", parent=self)
+                self._status_var.set("保存完成")
+
+            self.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _discard_dirty(self):
+        if not self._dirty:
+            return
+        if not messagebox.askyesno("确认", f"撤销 {len(self._dirty)} 处修改并还原？",
+                                   parent=self):
+            return
+        self._dirty.clear()
+        self._dirty_var.set("")
+        self._load_source()  # 重新从缓存加载
+
+    # ── 粘贴一列 ─────────────────────────────────────────────────────────────
+
+    def _paste_col_from_clipboard(self):
+        """
+        从剪贴板读取行数据（每行一个值，Tab/换行分隔的首列），
+        写入当前表格的指定列，从指定起始行开始。
+        常用场景：把 VLOOKUP 结果复制过来，一键填到目标列。
+        """
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            messagebox.showwarning("提示", "剪贴板为空", parent=self)
+            return
+
+        try:
+            col_idx  = int(self._paste_col_var.get().strip())
+            start_ri = int(self._paste_row_var.get().strip())
+        except ValueError:
+            messagebox.showwarning("提示", "请输入有效的列号和起始行", parent=self)
+            return
+
+        lines  = text.strip().split("\n")
+        values = [line.split("\t")[0].strip() for line in lines if line.strip()]
+
+        if not values:
+            messagebox.showinfo("提示", "剪贴板中没有可用数据", parent=self)
+            return
+
+        # 写入本地数据并标记脏
+        changed = 0
+        for offset, val in enumerate(values):
+            ri = start_ri + offset
+            while len(self._data) <= ri:
+                self._data.append([""] * self._col_count)
+            while len(self._data[ri]) <= col_idx:
+                self._data[ri].append("")
+            if self._data[ri][col_idx] != val:
+                self._data[ri][col_idx] = val
+                self._dirty[(ri, col_idx)] = val
+                changed += 1
+
+        # 刷新显示
+        for iid in list(self.tree.get_children()):
+            ri2 = self._iid_to_row.get(iid)
+            if ri2 is not None and start_ri <= ri2 < start_ri + len(values):
+                offset = ri2 - start_ri
+                vals   = list(self.tree.item(iid, "values"))
+                while len(vals) <= col_idx:
+                    vals.append("")
+                vals[col_idx] = values[offset]
+                self.tree.item(iid, values=vals)
+                self._refresh_row_tag(iid)
+
+        self._dirty_var.set(f"● 未保存修改: {len(self._dirty)} 个单元格")
+        self._status_var.set(
+            f"已粘贴 {changed} 个值到列 {col_idx}，起始行 {start_ri}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GUI 面板 5 — API 设置
 # ═════════════════════════════════════════════════════════════════════════════
 
 class SettingsPanel(tk.Frame):
@@ -1986,9 +2687,7 @@ class FeishuFormulaApp(tk.Tk):
 
         # 快速说明
         quick_tips = (
-            "① 数据源 — 添加飞书表格并同步    "
-            "② 函数构建 — 选择函数类型并配置参数    "
-            "③ 查看结果 — 预览、搜索、导出 Excel"
+            "① 数据源  ② 函数构建  ③ 查看结果 / 写回飞书  ④ 在线编辑表格  ⑤ API 设置"
         )
         tk.Label(header, text=quick_tips, bg=COLORS["primary"],
                  fg="#B0C4FF", font=("Microsoft YaHei UI", 8)).pack(side="right", padx=16)
@@ -1997,7 +2696,7 @@ class FeishuFormulaApp(tk.Tk):
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=0, pady=0)
 
-        self.results_panel = ResultsPanel(self.nb)
+        self.results_panel = ResultsPanel(self.nb, self.cache, self.api)
         self.builder_panel = FunctionBuilderPanel(
             self.nb, self.cache,
             on_results=self._on_results
@@ -2006,11 +2705,13 @@ class FeishuFormulaApp(tk.Tk):
             self.nb, self.cache, self.api,
             on_sources_changed=self._on_sources_changed
         )
+        self.editor_panel   = OnlineEditorPanel(self.nb, self.cache, self.api)
         self.settings_panel = SettingsPanel(self.nb, self.cache, self.api)
 
         self.nb.add(self.source_panel,   text="  数据源管理  ")
         self.nb.add(self.builder_panel,  text="  函数构建器  ")
         self.nb.add(self.results_panel,  text="  执行结果    ")
+        self.nb.add(self.editor_panel,   text="  在线编辑    ")
         self.nb.add(self.settings_panel, text="  API 设置    ")
 
     def _on_results(self, headers, rows, func_type):
@@ -2025,6 +2726,7 @@ class FeishuFormulaApp(tk.Tk):
 
     def _on_sources_changed(self):
         self.builder_panel.reload_sources()
+        self.editor_panel._reload_source_list()
 
     def _load_api_config(self):
         cfg = self.cache.load_api_config()
