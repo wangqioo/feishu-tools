@@ -1097,19 +1097,9 @@ class DataSourcePanel(tk.Frame):
         ttk.Radiobutton(api_row, text="飞书开放平台 API",
                         variable=use_open, value=True).pack(side="left", padx=4)
 
-        at_row = tk.Frame(online_frame, bg=COLORS["card"])
-        at_row.grid(row=len(ol_fields)*2+1, column=0, columnspan=2,
-                    padx=12, pady=(4, 8), sticky="w")
-        tk.Label(at_row, text="Access Token:", bg=COLORS["card"],
-                 fg=COLORS["text_sub"],
-                 font=("Microsoft YaHei UI", 8)).pack(side="left")
-        ol["access_token"] = tk.StringVar()
-        ttk.Entry(at_row, textvariable=ol["access_token"],
-                  width=38, show="*").pack(side="left", padx=8)
-
         ol["max_rows"] = tk.StringVar(value="5000")
         mr_row = tk.Frame(online_frame, bg=COLORS["card"])
-        mr_row.grid(row=len(ol_fields)*2+2, column=0, columnspan=2,
+        mr_row.grid(row=len(ol_fields)*2+1, column=0, columnspan=2,
                     padx=12, pady=(0, 8), sticky="w")
         tk.Label(mr_row, text="最大拉取行数:",
                  bg=COLORS["card"], fg=COLORS["text"],
@@ -1209,7 +1199,6 @@ class DataSourcePanel(tk.Frame):
                 return
             log_var.set("正在拉取工作表列表...")
             dlg.update_idletasks()
-            self.api.access_token = ol["access_token"].get()
             try:
                 sheets = self.api.fetch_meta(token, use_open_api=use_open.get())
                 if not sheets:
@@ -1242,7 +1231,6 @@ class DataSourcePanel(tk.Frame):
 
             def worker():
                 try:
-                    self.api.access_token = ol["access_token"].get()
                     rows = self.api.fetch_values(token, sid,
                                                  use_open_api=use_open.get(),
                                                  max_rows=max_r)
@@ -2929,19 +2917,21 @@ class SettingsPanel(tk.Frame):
             ("User ID",      "user_id",
              "企业内网用户 ID（工号）"),
             ("Access Token", "access_token",
-             "飞书开放平台 user_access_token（使用官方 API 时填写）"),
+             "可选 — 仅勾选「飞书开放平台 API」时需要填写，使用内网代理可留空"),
         ]
 
         self._vars: dict[str, tk.StringVar] = {}
         for ri, (label, key, hint) in enumerate(fields):
-            tk.Label(card, text=label, bg=COLORS["card"], fg=COLORS["text"],
+            is_token = key == "access_token"
+            label_fg = COLORS["text_sub"] if is_token else COLORS["text"]
+            tk.Label(card, text=label, bg=COLORS["card"], fg=label_fg,
                      font=("Microsoft YaHei UI", 9, "bold"),
                      width=14, anchor="e").grid(row=ri*2, column=0, padx=(12, 4), pady=(10, 0))
             var = tk.StringVar()
             self._vars[key] = var
-            show = "*" if key == "access_token" else ""
-            ttk.Entry(card, textvariable=var, width=56, show=show).grid(
-                row=ri*2, column=1, padx=4, pady=(10, 0), sticky="ew")
+            show = "*" if is_token else ""
+            entry = ttk.Entry(card, textvariable=var, width=56, show=show)
+            entry.grid(row=ri*2, column=1, padx=4, pady=(10, 0), sticky="ew")
             tk.Label(card, text=hint, bg=COLORS["card"], fg=COLORS["text_sub"],
                      font=("Microsoft YaHei UI", 7)).grid(
                          row=ri*2+1, column=1, padx=4, sticky="w")
