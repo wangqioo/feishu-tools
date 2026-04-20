@@ -110,6 +110,14 @@ class FeishuAPIClient:
         data = r.json()
         if data.get("code") not in (0, 200):
             raise RuntimeError(f"获取表格元信息失败：{data.get('msg')}（code={data.get('code')}）")
+        # 调试：打印顶层和 data 层的 key，便于确认表格标题字段名
+        import json as _json
+        _inner = data.get("data") or {}
+        print("[DEBUG] meta top-level keys:", list(data.keys()))
+        print("[DEBUG] meta data keys:", list(_inner.keys()))
+        _title_candidates = {k: v for k, v in _inner.items()
+                             if isinstance(v, str) and k not in ("code", "msg")}
+        print("[DEBUG] meta data string fields:", _json.dumps(_title_candidates, ensure_ascii=False))
         return data
 
     def get_sheet_values_proxy(self, token: str, sheet_id: str,
@@ -166,7 +174,11 @@ class FeishuAPIClient:
             data     = self.get_sheet_meta_open(token) or {}
             inner    = data.get("data") or {}
             sheets   = inner.get("sheets") or []
-            sp_title = inner.get("title") or ""
+            # open API 的 sheets/query 接口不返回表格标题，多路径兜底
+            sp_title = (inner.get("title") or
+                        inner.get("spreadsheetTitle") or
+                        inner.get("name") or
+                        (inner.get("properties") or {}).get("title") or "")
             return ([{
                 "sheet_id":    s["sheet_id"],
                 "sheet_title": s["title"],
@@ -178,7 +190,12 @@ class FeishuAPIClient:
             data     = self.get_sheet_meta_proxy(token) or {}
             inner    = data.get("data") or {}
             sheets   = inner.get("sheets") or []
-            sp_title = inner.get("title") or ""
+            # 代理 API 各版本字段名不统一，多路径兜底
+            sp_title = (inner.get("title") or
+                        inner.get("spreadsheetTitle") or
+                        inner.get("name") or
+                        (inner.get("properties") or {}).get("title") or
+                        data.get("title") or "")
             return ([{
                 "sheet_id":    s.get("sheetId", ""),
                 "sheet_title": s.get("title", ""),
@@ -206,12 +223,16 @@ class FeishuAPIClient:
                 rng  = f"{sheet_id}!A{start}:{self._col_letter(safe_cols - 1)}{end}"
                 data = self.get_sheet_values_open(token, sheet_id, range_str=rng) or {}
                 inner = data.get("data") or {}
-                batch = (inner.get("valueRange") or {}).get("values") or []
+                # 兼容有/无 valueRange 包装的两种响应结构
+                vr    = inner.get("valueRange") or inner
+                batch = vr.get("values") or []
             else:
                 data  = self.get_sheet_values_proxy(token, sheet_id, start, end,
                                                     col_count=safe_cols) or {}
                 inner = data.get("data") or {}
-                batch = (inner.get("valueRange") or {}).get("values") or []
+                # 兼容 {"data":{"valueRange":{"values":[...]}}} 和 {"data":{"values":[...]}}
+                vr    = inner.get("valueRange") or inner
+                batch = vr.get("values") or []
 
             all_rows.extend(batch)
 
@@ -783,34 +804,59 @@ class LocalFileReader:
         return Path(path).suffix.lower() in cls.SUPPORTED
 
     @classmethod
-    def read(cls, path: str, sheet_name: str = None) -> list[list[str]]:
+    def read(cls, path: str, sheet_name: str = None) -> tuple[list[list[str]], dict]:
         """
-        返回二维字符串列表，第 0 行为表头。
+        返回 (rows, stats)。
+        rows: 二维字符串列表，第 0 行为表头（已过滤隐藏行/列）。
+        stats: {"hidden_rows": N, "hidden_cols": N}（CSV 始终为 0）
         sheet_name: xlsx 时指定工作表名称，None 则取第一个工作表。
         """
         suffix = Path(path).suffix.lower()
         if suffix in (".xlsx", ".xls"):
             return cls._read_excel(path, sheet_name)
         elif suffix in (".csv", ".tsv"):
-            return cls._read_csv(path, suffix)
+            rows = cls._read_csv(path, suffix)
+            return rows, {"hidden_rows": 0, "hidden_cols": 0}
         else:
             raise ValueError(f"不支持的文件格式: {suffix}")
 
     @classmethod
-    def _read_excel(cls, path: str, sheet_name: str = None) -> list[list[str]]:
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    def _read_excel(cls, path: str, sheet_name: str = None) -> tuple[list[list[str]], dict]:
+        # read_only=False 才能访问 row_dimensions / column_dimensions（隐藏状态）
+        wb = openpyxl.load_workbook(path, read_only=False, data_only=True)
         if sheet_name and sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
         else:
             ws = wb.active
+
+        # 找出隐藏列的索引（1-based）
+        hidden_col_indices = set()
+        for col_letter, cd in ws.column_dimensions.items():
+            if cd.hidden:
+                col_idx = openpyxl.utils.column_index_from_string(col_letter)
+                hidden_col_indices.add(col_idx)
+
+        hidden_rows_skipped = 0
+        hidden_cols_skipped = len(hidden_col_indices)
         rows = []
-        for row in ws.iter_rows(values_only=True):
-            rows.append([("" if v is None else str(v)) for v in row])
+        for row_obj in ws.iter_rows():
+            row_num = row_obj[0].row if row_obj else None
+            # 跳过隐藏行
+            if row_num and ws.row_dimensions[row_num].hidden:
+                hidden_rows_skipped += 1
+                continue
+            # 过滤隐藏列的单元格
+            cells = [
+                cell for cell in row_obj
+                if cell.column not in hidden_col_indices
+            ]
+            rows.append([("" if cell.value is None else str(cell.value)) for cell in cells])
+
         wb.close()
         # 去掉尾部全空行
         while rows and all(v == "" for v in rows[-1]):
             rows.pop()
-        return rows
+        return rows, {"hidden_rows": hidden_rows_skipped, "hidden_cols": hidden_cols_skipped}
 
     @classmethod
     def _read_csv(cls, path: str, suffix: str) -> list[list[str]]:
@@ -1217,13 +1263,15 @@ class DataSourcePanel(tk.Frame):
         # Token 输入框：粘贴飞书链接时自动提取 token
         def _on_token_change(*_):
             val = ol["token"].get().strip()
-            if "feishu.cn" in val or "larksuite.com" in val:
+            # 只要看起来是 URL（含 / 且 长度 > 20），就尝试提取
+            if "/" in val and len(val) > 20:
+                # 取 ? 之前的路径部分，再取最后一个 / 后面的片段
+                path = val.split("?")[0]
+                segment = path.rstrip("/").rsplit("/", 1)[-1]
+                # 只有当提取到的片段像 token（字母数字+下划线，长度>=8）才替换
                 import re
-                m = re.search(
-                    r'(?:feishu\.cn|larksuite\.com)/(?:sheets|base|wiki|docs|docx)/([A-Za-z0-9_-]+)',
-                    val)
-                if m:
-                    ol["token"].set(m.group(1))
+                if segment and re.fullmatch(r'[A-Za-z0-9_-]{8,}', segment) and segment != val:
+                    ol["token"].set(segment)
         ol["token"].trace_add("write", _on_token_change)
 
         # API 模式  (base_row+2 / base_row+3，紧接工作表下拉行)
@@ -1362,33 +1410,46 @@ class DataSourcePanel(tk.Frame):
                 return
             log_var.set("正在拉取工作表列表...")
             dlg.update_idletasks()
-            try:
-                sheets, sp_title = self.api.fetch_meta(token, use_open_api=use_open.get())
-                if not sheets:
-                    log_var.set("未找到工作表，请检查 Token 或权限")
-                    return
-                # 填充多选列表，可见 sheet 默认选中，隐藏的不选
-                ol["_sheets_data"] = sheets
-                lb = ol["sheet_lb"]
-                lb.delete(0, tk.END)
-                for i, s in enumerate(sheets):
-                    label = f"{s['sheet_title']}  ({s['sheet_id']})"
-                    if s.get("hidden"):
-                        label += "  [隐藏]"
-                    lb.insert(tk.END, label)
-                    if not s.get("hidden"):
-                        lb.select_set(i)   # 只选中可见 sheet
-                # 自动填入数据源名称（表格标题，仅当名称栏为空时）
-                if not ol["name"].get().strip():
-                    auto_name = sp_title or (sheets[0]["sheet_title"] if sheets else "")
-                    if auto_name:
-                        ol["name"].set(auto_name)
-                log_var.set(
-                    f"发现 {len(sheets)} 个工作表，已全选，可取消不需要的工作表后点「添加并导入」")
-            except Exception as ex:
-                title, detail = _format_api_error(ex)
-                log_var.set(f"失败: {title}")
-                messagebox.showerror(title, detail, parent=dlg)
+            # 提前快照，避免子线程访问 Tkinter 变量
+            _use_open = use_open.get()
+
+            def fetch_worker():
+                try:
+                    sheets, sp_title = self.api.fetch_meta(token, use_open_api=_use_open)
+
+                    def _fill():
+                        if not dlg.winfo_exists(): return
+                        if not sheets:
+                            log_var.set("未找到工作表，请检查 Token 或权限")
+                            return
+                        ol["_sheets_data"] = sheets
+                        lb = ol["sheet_lb"]
+                        lb.delete(0, tk.END)
+                        for i, s in enumerate(sheets):
+                            label = f"{s['sheet_title']}  ({s['sheet_id']})"
+                            if s.get("hidden"):
+                                label += "  [隐藏]"
+                            lb.insert(tk.END, label)
+                            if not s.get("hidden"):
+                                lb.select_set(i)
+                        if not ol["name"].get().strip():
+                            auto_name = sp_title or (sheets[0]["sheet_title"] if sheets else "")
+                            if auto_name:
+                                ol["name"].set(auto_name)
+                        log_var.set(
+                            f"发现 {len(sheets)} 个工作表，已全选，可取消不需要的工作表后点「添加并导入」")
+                    dlg.after(0, _fill)
+
+                except Exception as ex:
+                    import traceback; traceback.print_exc()
+                    def _show_err(e=ex):
+                        if not dlg.winfo_exists(): return
+                        err_title, err_detail = _format_api_error(e)
+                        log_var.set(f"拉取失败：{err_title}")
+                        messagebox.showerror(err_title, err_detail, parent=dlg)
+                    dlg.after(0, _show_err)
+
+            threading.Thread(target=fetch_worker, daemon=True).start()
 
         def do_add_online():
             base_name = ol["name"].get().strip()
@@ -1406,40 +1467,61 @@ class DataSourcePanel(tk.Frame):
             log_var.set(f"正在导入 {len(sel_sheets)} 个工作表...")
             dlg.update_idletasks()
 
-            def worker():
-                errors = []
-                total_rows = 0
-                for s in sel_sheets:
-                    sid       = s["sheet_id"]
-                    title     = s["sheet_title"]
-                    col_count = s.get("col_count") or 52
-                    # 数据源名称：单个 sheet 直接用 base_name，多个则加 sheet 名
-                    ds_name = base_name if len(sel_sheets) == 1 else f"{base_name} - {title}"
-                    try:
-                        rows = self.api.fetch_values(token, sid,
-                                                     use_open_api=use_open.get(),
-                                                     col_count=col_count)
-                        src_id = self.cache.add_source(
-                            ds_name, token, sid, title,
-                            use_open_api=use_open.get(),
-                            source_type="online",
-                        )
-                        self.cache.store_rows(src_id, rows)
-                        total_rows += len(rows)
-                    except Exception as ex:
-                        errors.append(f"{title}: {ex}")
+            # 提前快照 use_open_api，避免子线程访问 Tkinter 变量
+            _use_open = use_open.get()
 
-                def _done():
-                    if not dlg.winfo_exists(): return
-                    self.refresh_table()
-                    if self.on_change: self.on_change()
-                    if errors:
-                        log_var.set(f"完成（{len(sel_sheets)-len(errors)}/{len(sel_sheets)} 成功），"
-                                    f"失败: {errors[0]}")
-                        messagebox.showwarning("部分失败", "\n".join(errors), parent=dlg)
-                    else:
-                        log_var.set(f"完成！共导入 {len(sel_sheets)} 个工作表，{total_rows} 行数据")
-                dlg.after(0, _done)
+            def worker():
+                try:
+                    errors = []
+                    total_rows = 0
+                    for idx, s in enumerate(sel_sheets, 1):
+                        sid       = s["sheet_id"]
+                        title     = s["sheet_title"]
+                        col_count = s.get("col_count") or 52
+                        ds_name = base_name if len(sel_sheets) == 1 else f"{base_name} - {title}"
+                        # 实时进度
+                        dlg.after(0, lambda t=title, i=idx: log_var.set(
+                            f"正在拉取（{i}/{len(sel_sheets)}）：{t} ..."))
+                        try:
+                            rows = self.api.fetch_values(token, sid,
+                                                         use_open_api=_use_open,
+                                                         col_count=col_count)
+                            src_id = self.cache.add_source(
+                                ds_name, token, sid, title,
+                                use_open_api=_use_open,
+                                source_type="online",
+                            )
+                            self.cache.store_rows(src_id, rows)
+                            total_rows += len(rows)
+                        except Exception as ex:
+                            import traceback; traceback.print_exc()
+                            errors.append(f"{title}: {ex}")
+
+                    def _done():
+                        if not dlg.winfo_exists(): return
+                        # 先更新状态，再做可能出错的 UI 刷新
+                        if errors:
+                            log_var.set(f"完成（{len(sel_sheets)-len(errors)}/{len(sel_sheets)} 成功）"
+                                        f" — 失败详情见弹窗")
+                        else:
+                            log_var.set(f"完成！共导入 {len(sel_sheets)} 个工作表，{total_rows} 行数据"
+                                        f"（注意：飞书 API 无法识别隐藏行/列，如表格含隐藏内容可能已一并导入）")
+                        try:
+                            self.refresh_table()
+                            if self.on_change: self.on_change()
+                        except Exception:
+                            import traceback; traceback.print_exc()
+                        if errors:
+                            messagebox.showwarning("部分失败", "\n".join(errors), parent=dlg)
+                    dlg.after(0, _done)
+
+                except Exception as ex:
+                    import traceback; traceback.print_exc()
+                    def _err(e=ex):
+                        if not dlg.winfo_exists(): return
+                        log_var.set(f"导入异常：{e}")
+                        messagebox.showerror("导入失败", str(e), parent=dlg)
+                    dlg.after(0, _err)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -1471,37 +1553,61 @@ class DataSourcePanel(tk.Frame):
             dlg.update_idletasks()
 
             def worker():
-                errors = []
-                total_rows = 0
-                for sheet_name in sel_sheets:
-                    # CSV/TSV 的虚拟条目名就是文件名 stem，实际读取时不传 sheet_name
-                    actual_sheet = sheet_name if LocalFileReader.list_sheets(fp) else None
-                    ds_name = base_name if len(sel_sheets) == 1 else f"{base_name} - {sheet_name}"
-                    try:
-                        rows = LocalFileReader.read(fp, sheet_name=actual_sheet)
-                        src_id = self.cache.add_source(
-                            ds_name,
-                            token=fp,
-                            sheet_id=sheet_name,
-                            sheet_title=sheet_name,
-                            use_open_api=False,
-                            source_type="local",
-                        )
-                        self.cache.store_rows(src_id, rows)
-                        total_rows += len(rows)
-                    except Exception as ex:
-                        errors.append(f"{sheet_name}: {ex}")
+                try:
+                    errors = []
+                    total_rows = 0
+                    total_hidden_rows = 0
+                    total_hidden_cols = 0
+                    for idx, sheet_name in enumerate(sel_sheets, 1):
+                        # CSV/TSV 的虚拟条目名就是文件名 stem，实际读取时不传 sheet_name
+                        actual_sheet = sheet_name if LocalFileReader.list_sheets(fp) else None
+                        ds_name = base_name if len(sel_sheets) == 1 else f"{base_name} - {sheet_name}"
+                        dlg.after(0, lambda sn=sheet_name, i=idx: log_var.set(
+                            f"正在读取（{i}/{len(sel_sheets)}）：{sn} ..."))
+                        try:
+                            rows, stats = LocalFileReader.read(fp, sheet_name=actual_sheet)
+                            src_id = self.cache.add_source(
+                                ds_name,
+                                token=fp,
+                                sheet_id=sheet_name,
+                                sheet_title=sheet_name,
+                                use_open_api=False,
+                                source_type="local",
+                            )
+                            self.cache.store_rows(src_id, rows)
+                            total_rows += len(rows)
+                            total_hidden_rows += stats.get("hidden_rows", 0)
+                            total_hidden_cols += stats.get("hidden_cols", 0)
+                        except Exception as ex:
+                            import traceback; traceback.print_exc()
+                            errors.append(f"{sheet_name}: {ex}")
 
-                def _done():
-                    if not dlg.winfo_exists(): return
-                    self.refresh_table()
-                    if self.on_change: self.on_change()
-                    if errors:
-                        log_var.set(f"完成（{len(sel_sheets)-len(errors)}/{len(sel_sheets)} 成功）")
-                        messagebox.showwarning("部分失败", "\n".join(errors), parent=dlg)
-                    else:
-                        log_var.set(f"完成！共导入 {len(sel_sheets)} 个工作表，{total_rows} 行数据")
-                dlg.after(0, _done)
+                    def _done():
+                        if not dlg.winfo_exists(): return
+                        self.refresh_table()
+                        if self.on_change: self.on_change()
+                        if errors:
+                            log_var.set(f"完成（{len(sel_sheets)-len(errors)}/{len(sel_sheets)} 成功）")
+                            messagebox.showwarning("部分失败", "\n".join(errors), parent=dlg)
+                        else:
+                            msg = f"完成！共导入 {len(sel_sheets)} 个工作表，{total_rows} 行数据"
+                            notes = []
+                            if total_hidden_rows:
+                                notes.append(f"已跳过 {total_hidden_rows} 个隐藏行")
+                            if total_hidden_cols:
+                                notes.append(f"已跳过 {total_hidden_cols} 个隐藏列")
+                            if notes:
+                                msg += f"（{'、'.join(notes)}）"
+                            log_var.set(msg)
+                    dlg.after(0, _done)
+
+                except Exception as ex:
+                    import traceback; traceback.print_exc()
+                    def _err(e=ex):
+                        if not dlg.winfo_exists(): return
+                        log_var.set(f"读取异常：{e}")
+                        messagebox.showerror("读取失败", str(e), parent=dlg)
+                    dlg.after(0, _err)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -1550,10 +1656,18 @@ class DataSourcePanel(tk.Frame):
                         if not Path(fp).exists():
                             raise FileNotFoundError(
                                 f"文件已不存在，请重新添加数据源:\n{fp}")
-                        rows = LocalFileReader.read(fp, sheet_name=sheet)
+                        rows, stats = LocalFileReader.read(fp, sheet_name=sheet)
                         self.cache.store_rows(s["id"], rows)
                         self.after(0, self.refresh_table)
                         self.after(0, lambda: self.on_change and self.on_change())
+                        notes = []
+                        if stats.get("hidden_rows"):
+                            notes.append(f"已跳过 {stats['hidden_rows']} 个隐藏行")
+                        if stats.get("hidden_cols"):
+                            notes.append(f"已跳过 {stats['hidden_cols']} 个隐藏列")
+                        if notes:
+                            self.after(0, lambda n=notes: messagebox.showinfo(
+                                "同步完成", f"同步成功，{'、'.join(n)}。", parent=self))
                     except Exception as ex:
                         self.after(0, lambda e=ex: messagebox.showerror(
                             "本地文件重新读取失败", str(e), parent=self))
