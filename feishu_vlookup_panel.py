@@ -1069,7 +1069,7 @@ class DataSourcePanel(tk.Frame):
     def _open_add_dialog(self):
         dlg = tk.Toplevel(self)
         dlg.title("添加数据源")
-        dlg.geometry("600x640")
+        dlg.geometry("600x720")
         dlg.resizable(False, False)
         dlg.grab_set()
         dlg.configure(bg=COLORS["bg"])
@@ -1136,34 +1136,49 @@ class DataSourcePanel(tk.Frame):
                      font=("Microsoft YaHei UI", 7)).grid(
                          row=ri*2+1, column=1, padx=4, sticky="w")
 
-        # 工作表下拉选择（拉取后填充）
+        # 工作表多选列表（拉取后填充）
         base_row = len(_simple_fields) * 2
         tk.Label(online_frame, text="工作表 *", bg=COLORS["card"],
                  fg=COLORS["text"],
                  font=("Microsoft YaHei UI", 9, "bold"),
                  width=14, anchor="e").grid(
-                     row=base_row, column=0, padx=(12, 4), pady=(8, 0))
-        ol["sheet_id"]    = tk.StringVar()
-        ol["sheet_title"] = tk.StringVar()
-        ol["_sheets_data"] = []   # list of {sheet_id, sheet_title}
-        sheet_cb = ttk.Combobox(online_frame, width=43, state="readonly")
-        sheet_cb.grid(row=base_row, column=1, padx=4, pady=(8, 0), sticky="ew")
-        ol["sheet_cb"] = sheet_cb
-        tk.Label(online_frame, text="先填写 Token 再点「拉取工作表列表」",
-                 bg=COLORS["card"], fg=COLORS["text_sub"],
-                 font=("Microsoft YaHei UI", 7)).grid(
-                     row=base_row+1, column=1, padx=4, sticky="w")
+                     row=base_row, column=0, padx=(12, 4), pady=(8, 4), sticky="n")
 
-        def _on_sheet_select(event=None):
-            idx = sheet_cb.current()
-            if idx < 0:
-                return
-            sheets_data = ol["_sheets_data"]
-            if idx < len(sheets_data):
-                s = sheets_data[idx]
-                ol["sheet_id"].set(s["sheet_id"])
-                ol["sheet_title"].set(s["sheet_title"])
-        sheet_cb.bind("<<ComboboxSelected>>", _on_sheet_select)
+        ol["_sheets_data"] = []   # list of {sheet_id, sheet_title}
+
+        sheet_list_frame = tk.Frame(online_frame, bg=COLORS["card"])
+        sheet_list_frame.grid(row=base_row, column=1, padx=4, pady=(8, 0), sticky="ew")
+
+        sheet_lb = tk.Listbox(sheet_list_frame, selectmode=tk.EXTENDED,
+                              height=5, width=44,
+                              bg="white", fg=COLORS["text"],
+                              selectbackground=COLORS["primary"],
+                              selectforeground="white",
+                              font=("Microsoft YaHei UI", 9),
+                              relief="solid", borderwidth=1)
+        sheet_sb = ttk.Scrollbar(sheet_list_frame, orient="vertical",
+                                  command=sheet_lb.yview)
+        sheet_lb.configure(yscrollcommand=sheet_sb.set)
+        sheet_lb.pack(side="left", fill="both", expand=True)
+        sheet_sb.pack(side="right", fill="y")
+        ol["sheet_lb"] = sheet_lb
+
+        # 全选/取消全选 控制行
+        sel_ctrl = tk.Frame(online_frame, bg=COLORS["card"])
+        sel_ctrl.grid(row=base_row+1, column=1, padx=4, pady=(2, 0), sticky="w")
+        tk.Label(sel_ctrl, text="先填写 Token 再点「拉取工作表列表」",
+                 bg=COLORS["card"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 7)).pack(side="left")
+        def _select_all():
+            sheet_lb.select_set(0, tk.END)
+        def _deselect_all():
+            sheet_lb.selection_clear(0, tk.END)
+        make_label_btn(sel_ctrl, "全选", _select_all,
+                       bg=COLORS["text_sub"], padx=6, pady=1,
+                       font_size=7).pack(side="right", padx=(4, 0))
+        make_label_btn(sel_ctrl, "取消", _deselect_all,
+                       bg=COLORS["border"], fg=COLORS["text"], padx=6, pady=1,
+                       font_size=7).pack(side="right", padx=(4, 0))
 
         # Token 输入框：粘贴飞书链接时自动提取 token
         def _on_token_change(*_):
@@ -1297,67 +1312,78 @@ class DataSourcePanel(tk.Frame):
                 if not sheets:
                     log_var.set("未找到工作表，请检查 Token 或权限")
                     return
-                # 填充下拉列表
+                # 填充多选列表，默认全选
                 ol["_sheets_data"] = sheets
-                cb = ol["sheet_cb"]
-                cb["values"] = [
-                    f"{s['sheet_title']}  ({s['sheet_id']})" for s in sheets
-                ]
-                cb.current(0)
-                ol["sheet_id"].set(sheets[0]["sheet_id"])
-                ol["sheet_title"].set(sheets[0]["sheet_title"])
-                # 自动填入数据源名称（表格标题 > 第一个工作表名，仅当名称栏为空时）
+                lb = ol["sheet_lb"]
+                lb.delete(0, tk.END)
+                for s in sheets:
+                    lb.insert(tk.END, f"{s['sheet_title']}  ({s['sheet_id']})")
+                lb.select_set(0, tk.END)   # 默认全选
+                # 自动填入数据源名称（表格标题，仅当名称栏为空时）
                 if not ol["name"].get().strip():
-                    auto_name = sp_title or sheets[0]["sheet_title"]
+                    auto_name = sp_title or (sheets[0]["sheet_title"] if sheets else "")
                     if auto_name:
                         ol["name"].set(auto_name)
                 log_var.set(
-                    f"发现 {len(sheets)} 个工作表，请在下拉列表中选择要导入的工作表")
+                    f"发现 {len(sheets)} 个工作表，已全选，可取消不需要的工作表后点「添加并导入」")
             except Exception as ex:
                 title, detail = _format_api_error(ex)
                 log_var.set(f"失败: {title}")
                 messagebox.showerror(title, detail, parent=dlg)
 
         def do_add_online():
-            name  = ol["name"].get().strip()
-            token = ol["token"].get().strip()
-            sid   = ol["sheet_id"].get().strip()
-            title = ol["sheet_title"].get().strip()
-            if not name or not token or not sid:
-                messagebox.showwarning("提示", "名称、Token、工作表 ID 为必填项", parent=dlg)
+            base_name = ol["name"].get().strip()
+            token     = ol["token"].get().strip()
+            sel_idx   = ol["sheet_lb"].curselection()
+            sheets_all = ol["_sheets_data"]
+            if not base_name or not token:
+                messagebox.showwarning("提示", "名称和表格 Token 为必填项", parent=dlg)
                 return
+            if not sel_idx:
+                messagebox.showwarning("提示", "请先点「拉取工作表列表」，然后至少选中一个工作表",
+                                       parent=dlg)
+                return
+            sel_sheets = [sheets_all[i] for i in sel_idx]
             try:
                 max_r = int(ol["max_rows"].get().strip() or "5000")
             except ValueError:
                 max_r = 5000
-            log_var.set("正在拉取数据...")
+            log_var.set(f"正在导入 {len(sel_sheets)} 个工作表...")
             dlg.update_idletasks()
 
             def worker():
-                try:
-                    rows = self.api.fetch_values(token, sid,
-                                                 use_open_api=use_open.get(),
-                                                 max_rows=max_r)
-                    src_id = self.cache.add_source(
-                        name, token, sid, title,
-                        use_open_api=use_open.get(),
-                        source_type="online",
-                    )
-                    self.cache.store_rows(src_id, rows)
-                    n = len(rows)
-                    def _ok_online(n=n):
-                        if not dlg.winfo_exists(): return
-                        log_var.set(f"完成！共拉取 {n} 行数据")
-                        self.refresh_table()
-                        if self.on_change: self.on_change()
-                    dlg.after(0, _ok_online)
-                except Exception as ex:
-                    err_title, err_detail = _format_api_error(ex)
-                    def _err_online(t=err_title, d=err_detail):
-                        if not dlg.winfo_exists(): return
-                        log_var.set(f"失败: {t}")
-                        messagebox.showerror(t, d, parent=dlg)
-                    dlg.after(0, _err_online)
+                errors = []
+                total_rows = 0
+                for s in sel_sheets:
+                    sid   = s["sheet_id"]
+                    title = s["sheet_title"]
+                    # 数据源名称：单个 sheet 直接用 base_name，多个则加 sheet 名
+                    ds_name = base_name if len(sel_sheets) == 1 else f"{base_name} - {title}"
+                    try:
+                        rows = self.api.fetch_values(token, sid,
+                                                     use_open_api=use_open.get(),
+                                                     max_rows=max_r)
+                        src_id = self.cache.add_source(
+                            ds_name, token, sid, title,
+                            use_open_api=use_open.get(),
+                            source_type="online",
+                        )
+                        self.cache.store_rows(src_id, rows)
+                        total_rows += len(rows)
+                    except Exception as ex:
+                        errors.append(f"{title}: {ex}")
+
+                def _done():
+                    if not dlg.winfo_exists(): return
+                    self.refresh_table()
+                    if self.on_change: self.on_change()
+                    if errors:
+                        log_var.set(f"完成（{len(sel_sheets)-len(errors)}/{len(sel_sheets)} 成功），"
+                                    f"失败: {errors[0]}")
+                        messagebox.showwarning("部分失败", "\n".join(errors), parent=dlg)
+                    else:
+                        log_var.set(f"完成！共导入 {len(sel_sheets)} 个工作表，{total_rows} 行数据")
+                dlg.after(0, _done)
 
             threading.Thread(target=worker, daemon=True).start()
 
