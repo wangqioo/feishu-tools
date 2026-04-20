@@ -113,9 +113,11 @@ class FeishuAPIClient:
         return data
 
     def get_sheet_values_proxy(self, token: str, sheet_id: str,
-                               start_row: int = 1, end_row: int = 5000) -> dict:
+                               start_row: int = 1, end_row: int = 5000,
+                               col_count: int = 52) -> dict:
         safe_rows = min(max(end_row, 100), 10000)
-        range_str = f"{sheet_id}!A1:ZZ{safe_rows}"  # ZZ = 702 列，覆盖绝大多数表格
+        end_col   = self._col_letter(max(col_count - 1, 0))
+        range_str = f"{sheet_id}!A1:{end_col}{safe_rows}"
         url    = f"{self.base_url}/fs/sheet/v1/getSheetsValue"
         params = {
             "origin":           self.app_id,
@@ -158,7 +160,7 @@ class FeishuAPIClient:
     def fetch_meta(self, token: str, use_open_api: bool = False
                    ) -> tuple[list[dict], str]:
         """返回 (sheets, spreadsheet_title)
-        sheets: [{sheet_id, sheet_title}, ...]
+        sheets: [{sheet_id, sheet_title, col_count, row_count}, ...]
         spreadsheet_title: 整个表格的标题
         """
         if use_open_api:
@@ -166,28 +168,42 @@ class FeishuAPIClient:
             inner    = data.get("data") or {}
             sheets   = inner.get("sheets") or []
             sp_title = inner.get("title") or ""
-            return ([{"sheet_id": s["sheet_id"], "sheet_title": s["title"]} for s in sheets],
-                    sp_title)
+            return ([{
+                "sheet_id":    s["sheet_id"],
+                "sheet_title": s["title"],
+                "col_count":   s.get("columnCount") or 52,
+                "row_count":   s.get("rowCount") or 5000,
+            } for s in sheets], sp_title)
         else:
             data     = self.get_sheet_meta_proxy(token) or {}
             inner    = data.get("data") or {}
             sheets   = inner.get("sheets") or []
             sp_title = inner.get("title") or ""
-            return ([{"sheet_id": s.get("sheetId", ""), "sheet_title": s.get("title", "")}
-                     for s in sheets],
-                    sp_title)
+            return ([{
+                "sheet_id":    s.get("sheetId", ""),
+                "sheet_title": s.get("title", ""),
+                "col_count":   s.get("columnCount") or 52,
+                "row_count":   s.get("rowCount") or 5000,
+            } for s in sheets], sp_title)
 
     def fetch_values(self, token: str, sheet_id: str,
                      use_open_api: bool = False,
-                     max_rows: int = 5000) -> list[list]:
-        """返回二维列表 rows[row][col]"""
+                     max_rows: int = 5000,
+                     col_count: int = 52) -> list[list]:
+        """返回二维列表 rows[row][col]
+        col_count: 实际列数，用于计算请求 range，避免超过 API 大小限制
+        """
+        # 列数加 5 保险，但不超过 200（避免 10MB 限制）
+        safe_cols = min(col_count + 5, 200)
         if use_open_api:
-            data       = self.get_sheet_values_open(token, sheet_id) or {}
-            inner      = data.get("data") or {}
+            rng  = f"{sheet_id}!A1:{self._col_letter(safe_cols - 1)}{max_rows}"
+            data = self.get_sheet_values_open(token, sheet_id, range_str=rng) or {}
+            inner = data.get("data") or {}
             value_range = inner.get("valueRange") or {}
             return value_range.get("values") or []
         else:
-            data        = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows) or {}
+            data        = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows,
+                                                      col_count=safe_cols) or {}
             inner       = data.get("data") or {}
             value_range = inner.get("valueRange") or {}
             return value_range.get("values") or []
@@ -1355,14 +1371,16 @@ class DataSourcePanel(tk.Frame):
                 errors = []
                 total_rows = 0
                 for s in sel_sheets:
-                    sid   = s["sheet_id"]
-                    title = s["sheet_title"]
+                    sid       = s["sheet_id"]
+                    title     = s["sheet_title"]
+                    col_count = s.get("col_count") or 52
                     # 数据源名称：单个 sheet 直接用 base_name，多个则加 sheet 名
                     ds_name = base_name if len(sel_sheets) == 1 else f"{base_name} - {title}"
                     try:
                         rows = self.api.fetch_values(token, sid,
                                                      use_open_api=use_open.get(),
-                                                     max_rows=max_r)
+                                                     max_rows=max_r,
+                                                     col_count=col_count)
                         src_id = self.cache.add_source(
                             ds_name, token, sid, title,
                             use_open_api=use_open.get(),
@@ -1494,7 +1512,8 @@ class DataSourcePanel(tk.Frame):
                     try:
                         rows = self.api.fetch_values(
                             s["token"], s["sheet_id"],
-                            use_open_api=bool(s["use_open_api"])
+                            use_open_api=bool(s["use_open_api"]),
+                            col_count=s.get("col_count") or 52,
                         )
                         self.cache.store_rows(s["id"], rows)
                         self.after(0, self.refresh_table)
@@ -2805,7 +2824,8 @@ class OnlineEditorPanel(tk.Frame):
             try:
                 rows = self.api.fetch_values(
                     src["token"], src["sheet_id"],
-                    use_open_api=bool(src["use_open_api"])
+                    use_open_api=bool(src["use_open_api"]),
+                    col_count=src.get("col_count") or 52,
                 )
                 self.cache.store_rows(sid, rows)
                 self.after(0, self._load_source)
