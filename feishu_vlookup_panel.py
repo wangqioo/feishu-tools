@@ -115,9 +115,8 @@ class FeishuAPIClient:
     def get_sheet_values_proxy(self, token: str, sheet_id: str,
                                start_row: int = 1, end_row: int = 5000,
                                col_count: int = 52) -> dict:
-        safe_rows = min(max(end_row, 100), 10000)
         end_col   = self._col_letter(max(col_count - 1, 0))
-        range_str = f"{sheet_id}!A1:{end_col}{safe_rows}"
+        range_str = f"{sheet_id}!A{start_row}:{end_col}{end_row}"
         url    = f"{self.base_url}/fs/sheet/v1/getSheetsValue"
         params = {
             "origin":           self.app_id,
@@ -188,25 +187,42 @@ class FeishuAPIClient:
 
     def fetch_values(self, token: str, sheet_id: str,
                      use_open_api: bool = False,
-                     max_rows: int = 5000,
+                     max_rows: int = 0,
                      col_count: int = 52) -> list[list]:
-        """返回二维列表 rows[row][col]
-        col_count: 实际列数，用于计算请求 range，避免超过 API 大小限制
+        """自动分页拉取所有数据，无行数上限。
+        max_rows: 0 表示不限制（拉全部），>0 则最多拉取该行数（含表头）。
+        col_count: 实际列数，按实际列数请求，避免 10MB 超限。
         """
-        # 列数加 5 保险，但不超过 200（避免 10MB 限制）
+        BATCH = 5000           # 每批行数（控制单次响应 < 10MB）
         safe_cols = min(col_count + 5, 200)
-        if use_open_api:
-            rng  = f"{sheet_id}!A1:{self._col_letter(safe_cols - 1)}{max_rows}"
-            data = self.get_sheet_values_open(token, sheet_id, range_str=rng) or {}
-            inner = data.get("data") or {}
-            value_range = inner.get("valueRange") or {}
-            return value_range.get("values") or []
-        else:
-            data        = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows,
-                                                      col_count=safe_cols) or {}
-            inner       = data.get("data") or {}
-            value_range = inner.get("valueRange") or {}
-            return value_range.get("values") or []
+        all_rows: list[list] = []
+        start = 1              # Feishu range 行号从 1 开始
+
+        while True:
+            end = start + BATCH - 1
+            if use_open_api:
+                rng  = f"{sheet_id}!A{start}:{self._col_letter(safe_cols - 1)}{end}"
+                data = self.get_sheet_values_open(token, sheet_id, range_str=rng) or {}
+                inner = data.get("data") or {}
+                batch = (inner.get("valueRange") or {}).get("values") or []
+            else:
+                data  = self.get_sheet_values_proxy(token, sheet_id, start, end,
+                                                    col_count=safe_cols) or {}
+                inner = data.get("data") or {}
+                batch = (inner.get("valueRange") or {}).get("values") or []
+
+            all_rows.extend(batch)
+
+            # 如果返回行数不足一批，说明已到末尾
+            if len(batch) < BATCH:
+                break
+            # 如果设置了行数上限且已达到，停止
+            if max_rows > 0 and len(all_rows) >= max_rows:
+                all_rows = all_rows[:max_rows]
+                break
+            start += BATCH
+
+        return all_rows
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
@@ -1221,18 +1237,13 @@ class DataSourcePanel(tk.Frame):
         ttk.Radiobutton(api_row, text="飞书开放平台 API",
                         variable=use_open, value=True).pack(side="left", padx=4)
 
-        ol["max_rows"] = tk.StringVar(value="5000")
-        mr_row = tk.Frame(online_frame, bg=COLORS["card"])
-        mr_row.grid(row=base_row+3, column=0, columnspan=2,
-                    padx=12, pady=(0, 8), sticky="w")
-        tk.Label(mr_row, text="最大拉取行数:",
-                 bg=COLORS["card"], fg=COLORS["text"],
-                 font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
-        ttk.Entry(mr_row, textvariable=ol["max_rows"], width=8).pack(
-            side="left", padx=8)
-        tk.Label(mr_row, text="行（含表头）",
+        # 自动分页拉取全部行，不再需要行数输入框
+        tk.Label(online_frame,
+                 text="自动分页拉取所有行，无行数限制",
                  bg=COLORS["card"], fg=COLORS["text_sub"],
-                 font=("Microsoft YaHei UI", 8)).pack(side="left")
+                 font=("Microsoft YaHei UI", 8)).grid(
+                     row=base_row+3, column=0, columnspan=2,
+                     padx=12, pady=(0, 8), sticky="w")
         online_frame.columnconfigure(1, weight=1)
 
         # ── 本地文件参数 ──────────────────────────────────────────────────────
@@ -1360,10 +1371,6 @@ class DataSourcePanel(tk.Frame):
                                        parent=dlg)
                 return
             sel_sheets = [sheets_all[i] for i in sel_idx]
-            try:
-                max_r = int(ol["max_rows"].get().strip() or "5000")
-            except ValueError:
-                max_r = 5000
             log_var.set(f"正在导入 {len(sel_sheets)} 个工作表...")
             dlg.update_idletasks()
 
@@ -1379,7 +1386,6 @@ class DataSourcePanel(tk.Frame):
                     try:
                         rows = self.api.fetch_values(token, sid,
                                                      use_open_api=use_open.get(),
-                                                     max_rows=max_r,
                                                      col_count=col_count)
                         src_id = self.cache.add_source(
                             ds_name, token, sid, title,
