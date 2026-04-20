@@ -157,17 +157,17 @@ class FeishuAPIClient:
         spreadsheet_title: 整个表格的标题
         """
         if use_open_api:
-            data   = self.get_sheet_meta_open(token) or {}
-            inner  = data.get("data", {})
-            sheets = inner.get("sheets", [])
-            sp_title = inner.get("title", "")
+            data     = self.get_sheet_meta_open(token) or {}
+            inner    = data.get("data") or {}
+            sheets   = inner.get("sheets") or []
+            sp_title = inner.get("title") or ""
             return ([{"sheet_id": s["sheet_id"], "sheet_title": s["title"]} for s in sheets],
                     sp_title)
         else:
-            data   = self.get_sheet_meta_proxy(token) or {}
-            inner  = data.get("data", {})
-            sheets = inner.get("sheets", [])
-            sp_title = inner.get("title", "")
+            data     = self.get_sheet_meta_proxy(token) or {}
+            inner    = data.get("data") or {}
+            sheets   = inner.get("sheets") or []
+            sp_title = inner.get("title") or ""
             return ([{"sheet_id": s.get("sheetId", ""), "sheet_title": s.get("title", "")}
                      for s in sheets],
                     sp_title)
@@ -177,11 +177,14 @@ class FeishuAPIClient:
                      max_rows: int = 5000) -> list[list]:
         """返回二维列表 rows[row][col]"""
         if use_open_api:
-            data = self.get_sheet_values_open(token, sheet_id) or {}
-            return data.get("data", {}).get("valueRange", {}).get("values", [])
+            data       = self.get_sheet_values_open(token, sheet_id) or {}
+            inner      = data.get("data") or {}
+            value_range = inner.get("valueRange") or {}
+            return value_range.get("values") or []
         else:
-            data = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows) or {}
-            return data.get("data", {}).get("values", [])
+            data  = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows) or {}
+            inner = data.get("data") or {}
+            return inner.get("values") or []
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
