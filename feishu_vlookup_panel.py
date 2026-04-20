@@ -115,7 +115,7 @@ class FeishuAPIClient:
     def get_sheet_values_proxy(self, token: str, sheet_id: str,
                                start_row: int = 1, end_row: int = 5000) -> dict:
         safe_rows = min(max(end_row, 100), 10000)
-        range_str = f"{sheet_id}!A1:Z{safe_rows}"
+        range_str = f"{sheet_id}!A1:ZZ{safe_rows}"  # ZZ = 702 列，覆盖绝大多数表格
         url    = f"{self.base_url}/fs/sheet/v1/getSheetsValue"
         params = {
             "origin":           self.app_id,
@@ -146,7 +146,7 @@ class FeishuAPIClient:
 
     def get_sheet_values_open(self, token: str, sheet_id: str,
                               range_str: str = None) -> dict:
-        rng = range_str or f"{sheet_id}!A1:ZZ5000"
+        rng = range_str or f"{sheet_id}!A1:ZZ10000"
         url = (f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets"
                f"/{token}/values/{rng}")
         r = requests.get(url, headers=self._open_headers(), timeout=60)
@@ -348,14 +348,39 @@ class DataCache:
 
     # ── 数据写入 / 读取 ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _cell_to_str(val) -> str:
+        """将飞书单元格值转为字符串，兼容 URL 类型（dict）和普通值"""
+        if val is None:
+            return ""
+        if isinstance(val, dict):
+            # 飞书 URL 类型: {"text": "显示文本", "link": "..."}
+            return val.get("text") or val.get("link") or ""
+        if isinstance(val, list):
+            # 飞书多值类型：取第一个有效文本
+            for item in val:
+                s = DataCache._cell_to_str(item)
+                if s:
+                    return s
+            return ""
+        return str(val)
+
     def store_rows(self, source_id: int, rows: list[list]):
+        # 去除末尾全空行（API 按请求行数补齐产生的空行）
+        while rows and all(
+            (v is None or (isinstance(v, str) and v.strip() == "") or v == "")
+            for v in rows[-1]
+        ):
+            rows.pop()
+
         c = self.conn.cursor()
         c.execute("DELETE FROM sheet_rows WHERE source_id=?", (source_id,))
         batch = []
         for ri, row in enumerate(rows):
             for ci, val in enumerate(row):
-                if val is not None:
-                    batch.append((source_id, ri, ci, str(val)))
+                s = self._cell_to_str(val)
+                if s:
+                    batch.append((source_id, ri, ci, s))
         if batch:
             c.executemany("INSERT INTO sheet_rows(source_id,row_idx,col_idx,value)"
                           " VALUES(?,?,?,?)", batch)
