@@ -1152,10 +1152,10 @@ class DataSourcePanel(tk.Frame):
                     ol["token"].set(m.group(1))
         ol["token"].trace_add("write", _on_token_change)
 
-        # API 模式
+        # API 模式  (base_row+2 / base_row+3，紧接工作表下拉行)
         use_open = tk.BooleanVar(value=False)
         api_row = tk.Frame(online_frame, bg=COLORS["card"])
-        api_row.grid(row=len(ol_fields)*2, column=0, columnspan=2,
+        api_row.grid(row=base_row+2, column=0, columnspan=2,
                      padx=12, pady=(6, 0), sticky="w")
         tk.Label(api_row, text="API 模式:", bg=COLORS["card"],
                  fg=COLORS["text"],
@@ -1167,7 +1167,7 @@ class DataSourcePanel(tk.Frame):
 
         ol["max_rows"] = tk.StringVar(value="5000")
         mr_row = tk.Frame(online_frame, bg=COLORS["card"])
-        mr_row.grid(row=len(ol_fields)*2+1, column=0, columnspan=2,
+        mr_row.grid(row=base_row+3, column=0, columnspan=2,
                     padx=12, pady=(0, 8), sticky="w")
         tk.Label(mr_row, text="最大拉取行数:",
                  bg=COLORS["card"], fg=COLORS["text"],
