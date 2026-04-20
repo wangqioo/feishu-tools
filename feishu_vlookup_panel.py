@@ -1278,10 +1278,8 @@ class DataSourcePanel(tk.Frame):
             )
             if fp:
                 lc["filepath"].set(fp)
-                # 自动填充名称（如果还没填）
-                if not lc["name"].get():
-                    lc["name"].set(Path(fp).stem)
-                # 如果是 xlsx，刷新工作表列表
+                # 自动填充名称（用文件名，始终更新）
+                lc["name"].set(Path(fp).stem)
                 _refresh_sheets(fp)
 
         make_label_btn(path_row, "浏览...", _browse_file,
@@ -1291,24 +1289,52 @@ class DataSourcePanel(tk.Frame):
         tk.Label(local_frame, text="工作表",
                  bg=COLORS["card"], fg=COLORS["text"],
                  font=("Microsoft YaHei UI", 9, "bold"),
-                 width=14, anchor="e").grid(row=2, column=0, padx=(12, 4), pady=(8, 0))
-        lc["sheet"] = tk.StringVar()
-        lc["sheet_cb"] = ttk.Combobox(local_frame, textvariable=lc["sheet"],
-                                       width=30, state="readonly")
-        lc["sheet_cb"].grid(row=2, column=1, padx=4, pady=(8, 0), sticky="w")
-        tk.Label(local_frame, text="CSV/TSV 文件只有一个工作表，无需选择",
+                 width=14, anchor="e").grid(row=2, column=0, padx=(12, 4), pady=(8, 4), sticky="n")
+
+        lc_sheet_frame = tk.Frame(local_frame, bg=COLORS["card"])
+        lc_sheet_frame.grid(row=2, column=1, padx=4, pady=(8, 0), sticky="ew")
+        lc_sheet_lb = tk.Listbox(lc_sheet_frame, selectmode=tk.EXTENDED,
+                                  height=4, width=44,
+                                  bg="white", fg=COLORS["text"],
+                                  selectbackground=COLORS["primary"],
+                                  selectforeground="white",
+                                  font=("Microsoft YaHei UI", 9),
+                                  relief="solid", borderwidth=1)
+        lc_sheet_sb = ttk.Scrollbar(lc_sheet_frame, orient="vertical",
+                                     command=lc_sheet_lb.yview)
+        lc_sheet_lb.configure(yscrollcommand=lc_sheet_sb.set)
+        lc_sheet_lb.pack(side="left", fill="both", expand=True)
+        lc_sheet_sb.pack(side="right", fill="y")
+        lc["sheet_lb"] = lc_sheet_lb
+
+        lc_sel_ctrl = tk.Frame(local_frame, bg=COLORS["card"])
+        lc_sel_ctrl.grid(row=3, column=1, padx=4, pady=(2, 8), sticky="w")
+        tk.Label(lc_sel_ctrl, text="CSV/TSV 只有一个工作表，自动选中",
                  bg=COLORS["card"], fg=COLORS["text_sub"],
-                 font=("Microsoft YaHei UI", 7)).grid(
-                     row=3, column=1, padx=4, sticky="w", pady=(0, 8))
+                 font=("Microsoft YaHei UI", 7)).pack(side="left")
+        def _lc_select_all():
+            lc_sheet_lb.select_set(0, tk.END)
+        def _lc_deselect_all():
+            lc_sheet_lb.selection_clear(0, tk.END)
+        make_label_btn(lc_sel_ctrl, "全选", _lc_select_all,
+                       bg=COLORS["text_sub"], padx=6, pady=1,
+                       font_size=7).pack(side="right", padx=(4, 0))
+        make_label_btn(lc_sel_ctrl, "取消", _lc_deselect_all,
+                       bg=COLORS["border"], fg=COLORS["text"], padx=6, pady=1,
+                       font_size=7).pack(side="right", padx=(4, 0))
         local_frame.columnconfigure(1, weight=1)
 
         def _refresh_sheets(fp: str):
             sheets = LocalFileReader.list_sheets(fp)
-            lc["sheet_cb"]["values"] = sheets
+            lc_sheet_lb.delete(0, tk.END)
             if sheets:
-                lc["sheet"].set(sheets[0])
+                for s in sheets:
+                    lc_sheet_lb.insert(tk.END, s)
+                lc_sheet_lb.select_set(0, tk.END)   # 默认全选
             else:
-                lc["sheet"].set("")
+                # CSV/TSV：插入虚拟条目并选中
+                lc_sheet_lb.insert(tk.END, Path(fp).stem)
+                lc_sheet_lb.select_set(0)
 
         lc["filepath"].trace_add("write", lambda *_: (
             _refresh_sheets(lc["filepath"].get())
@@ -1412,10 +1438,11 @@ class DataSourcePanel(tk.Frame):
             threading.Thread(target=worker, daemon=True).start()
 
         def do_add_local():
-            name = lc["name"].get().strip()
-            fp   = lc["filepath"].get().strip()
-            if not name or not fp:
-                messagebox.showwarning("提示", "名称和文件路径为必填项", parent=dlg)
+            base_name = lc["name"].get().strip()
+            fp        = lc["filepath"].get().strip()
+            sel_idx   = lc["sheet_lb"].curselection()
+            if not fp:
+                messagebox.showwarning("提示", "请选择文件", parent=dlg)
                 return
             if not Path(fp).exists():
                 messagebox.showerror("错误", f"文件不存在:\n{fp}", parent=dlg)
@@ -1426,36 +1453,49 @@ class DataSourcePanel(tk.Frame):
                                      f"支持: {', '.join(LocalFileReader.SUPPORTED)}",
                                      parent=dlg)
                 return
-            sheet = lc["sheet"].get().strip() or None
-            log_var.set("正在读取文件...")
+            if not sel_idx:
+                messagebox.showwarning("提示", "请至少选中一个工作表", parent=dlg)
+                return
+            # 数据源名称默认用文件名
+            if not base_name:
+                base_name = Path(fp).stem
+            # 获取所有选中工作表名（Listbox 内容）
+            sel_sheets = [lc["sheet_lb"].get(i) for i in sel_idx]
+            log_var.set(f"正在读取 {len(sel_sheets)} 个工作表...")
             dlg.update_idletasks()
 
             def worker():
-                try:
-                    rows = LocalFileReader.read(fp, sheet_name=sheet)
-                    title = sheet or Path(fp).stem
-                    src_id = self.cache.add_source(
-                        name,
-                        token=fp,           # 用文件路径当 token
-                        sheet_id=sheet or "sheet1",
-                        sheet_title=title,
-                        use_open_api=False,
-                        source_type="local",
-                    )
-                    self.cache.store_rows(src_id, rows)
-                    n = len(rows)
-                    def _ok_local(n=n):
-                        if not dlg.winfo_exists(): return
-                        log_var.set(f"完成！共读取 {n} 行数据")
-                        self.refresh_table()
-                        if self.on_change: self.on_change()
-                    dlg.after(0, _ok_local)
-                except Exception as ex:
-                    def _err_local(e=ex):
-                        if not dlg.winfo_exists(): return
-                        log_var.set(f"读取失败: {e}")
-                        messagebox.showerror("读取失败", str(e), parent=dlg)
-                    dlg.after(0, _err_local)
+                errors = []
+                total_rows = 0
+                for sheet_name in sel_sheets:
+                    # CSV/TSV 的虚拟条目名就是文件名 stem，实际读取时不传 sheet_name
+                    actual_sheet = sheet_name if LocalFileReader.list_sheets(fp) else None
+                    ds_name = base_name if len(sel_sheets) == 1 else f"{base_name} - {sheet_name}"
+                    try:
+                        rows = LocalFileReader.read(fp, sheet_name=actual_sheet)
+                        src_id = self.cache.add_source(
+                            ds_name,
+                            token=fp,
+                            sheet_id=sheet_name,
+                            sheet_title=sheet_name,
+                            use_open_api=False,
+                            source_type="local",
+                        )
+                        self.cache.store_rows(src_id, rows)
+                        total_rows += len(rows)
+                    except Exception as ex:
+                        errors.append(f"{sheet_name}: {ex}")
+
+                def _done():
+                    if not dlg.winfo_exists(): return
+                    self.refresh_table()
+                    if self.on_change: self.on_change()
+                    if errors:
+                        log_var.set(f"完成（{len(sel_sheets)-len(errors)}/{len(sel_sheets)} 成功）")
+                        messagebox.showwarning("部分失败", "\n".join(errors), parent=dlg)
+                    else:
+                        log_var.set(f"完成！共导入 {len(sel_sheets)} 个工作表，{total_rows} 行数据")
+                dlg.after(0, _done)
 
             threading.Thread(target=worker, daemon=True).start()
 
