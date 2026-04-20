@@ -172,6 +172,7 @@ class FeishuAPIClient:
                 "sheet_title": s["title"],
                 "col_count":   s.get("columnCount") or 52,
                 "row_count":   s.get("rowCount") or 5000,
+                "hidden":      bool(s.get("hidden") or s.get("isHidden")),
             } for s in sheets], sp_title)
         else:
             data     = self.get_sheet_meta_proxy(token) or {}
@@ -183,6 +184,7 @@ class FeishuAPIClient:
                 "sheet_title": s.get("title", ""),
                 "col_count":   s.get("columnCount") or 52,
                 "row_count":   s.get("rowCount") or 5000,
+                "hidden":      bool(s.get("hidden") or s.get("isHidden")),
             } for s in sheets], sp_title)
 
     def fetch_values(self, token: str, sheet_id: str,
@@ -1365,13 +1367,17 @@ class DataSourcePanel(tk.Frame):
                 if not sheets:
                     log_var.set("未找到工作表，请检查 Token 或权限")
                     return
-                # 填充多选列表，默认全选
+                # 填充多选列表，可见 sheet 默认选中，隐藏的不选
                 ol["_sheets_data"] = sheets
                 lb = ol["sheet_lb"]
                 lb.delete(0, tk.END)
-                for s in sheets:
-                    lb.insert(tk.END, f"{s['sheet_title']}  ({s['sheet_id']})")
-                lb.select_set(0, tk.END)   # 默认全选
+                for i, s in enumerate(sheets):
+                    label = f"{s['sheet_title']}  ({s['sheet_id']})"
+                    if s.get("hidden"):
+                        label += "  [隐藏]"
+                    lb.insert(tk.END, label)
+                    if not s.get("hidden"):
+                        lb.select_set(i)   # 只选中可见 sheet
                 # 自动填入数据源名称（表格标题，仅当名称栏为空时）
                 if not ol["name"].get().strip():
                     auto_name = sp_title or (sheets[0]["sheet_title"] if sheets else "")
