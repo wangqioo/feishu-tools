@@ -3106,7 +3106,7 @@ class ExamplesPanel(tk.Frame):
         desc_card = make_card(inner)
         desc_card.pack(fill="x", **pad)
         tk.Label(desc_card, text=ex["name"], bg=COLORS["card"],
-                 fg=COLORS["accent"], font=("Microsoft YaHei UI", 12, "bold")
+                 fg=COLORS["primary"], font=("Microsoft YaHei UI", 12, "bold")
                  ).pack(anchor="w", padx=12, pady=(10, 2))
         tk.Label(desc_card, text=ex["desc"], bg=COLORS["card"],
                  fg=COLORS["text"], font=("Microsoft YaHei UI", 9),
@@ -3154,7 +3154,7 @@ class ExamplesPanel(tk.Frame):
             row_f = tk.Frame(step_card, bg=COLORS["card"])
             row_f.pack(fill="x", padx=12, pady=2)
             tk.Label(row_f, text=f"  {i}.", bg=COLORS["card"],
-                     fg=COLORS["accent"], font=("Microsoft YaHei UI", 9, "bold"),
+                     fg=COLORS["primary"], font=("Microsoft YaHei UI", 9, "bold"),
                      width=3).pack(side="left")
             tk.Label(row_f, text=label, bg=COLORS["card"],
                      fg=COLORS["text"], font=("Microsoft YaHei UI", 9, "bold"),
