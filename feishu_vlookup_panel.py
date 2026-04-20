@@ -210,7 +210,11 @@ class FeishuAPIClient:
         """内网代理写入（行列均 0-based，0 行为表头行）"""
         if not values:
             return {}
-        url  = f"{self.base_url}/fs/sheet/v1/setSheetsValue"
+        url    = f"{self.base_url}/fs/sheet/v1/setSheetsValue"
+        params = {
+            "origin": self.app_id,
+            "userId": self.user_id,
+        }
         body = {
             "spreadsheetToken": token,
             "sheetId":          sheet_id,
@@ -218,9 +222,12 @@ class FeishuAPIClient:
             "startCol":         start_col,
             "values":           values,
         }
-        r = requests.post(url, json=body, headers=self._proxy_headers(), timeout=60)
+        r = requests.post(url, params=params, json=body, timeout=60)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        if data.get("code") not in (0, 200):
+            raise RuntimeError(f"写入表格失败：{data.get('msg')}（code={data.get('code')}）")
+        return data
 
     def write_values_open(self, token: str, sheet_id: str,
                           values: list[list],
