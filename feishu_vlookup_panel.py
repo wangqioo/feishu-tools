@@ -2890,7 +2890,307 @@ class OnlineEditorPanel(tk.Frame):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# GUI 面板 5 — API 设置
+# GUI 面板 5 — 使用示例
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ExamplesPanel(tk.Frame):
+    """每个函数的使用示例面板"""
+
+    # ── 示例数据定义 ─────────────────────────────────────────────────────────
+
+    EXAMPLES = [
+        {
+            "name": "VLOOKUP",
+            "desc": "在「查找表」的指定列中搜索关键字，返回同一行的其他列数据。\n适合场景：用零件号查描述、价格、规格等。",
+            "source_title": "查找表（零件信息表）",
+            "source_cols": ["零件号", "描述", "单价", "库存"],
+            "source_rows": [
+                ["P001", "螺丝 M3×10", "0.05", "10000"],
+                ["P002", "螺母 M3",    "0.03",  "8000"],
+                ["P003", "垫片 M3",    "0.02",  "5000"],
+                ["P004", "螺栓 M4×20", "0.12",  "3000"],
+            ],
+            "lookup_title": "查找值（需要查的零件号）",
+            "lookup_items": ["P001", "P003", "P005（不存在）"],
+            "steps": [
+                ("查找值来源",   "从另一张表的「零件号」列，或直接输入"),
+                ("查找范围",     "选「零件信息表」→ 查找列选「零件号」"),
+                ("返回列",       "勾选「描述」「单价」（可多选）"),
+                ("匹配模式",     "精确匹配"),
+            ],
+            "result_cols": ["查找值", "描述", "单价", "匹配状态"],
+            "result_rows": [
+                ["P001", "螺丝 M3×10", "0.05", "matched"],
+                ["P003", "垫片 M3",    "0.02", "matched"],
+                ["P005", "#N/A",       "#N/A", "not_found"],
+            ],
+        },
+        {
+            "name": "XLOOKUP",
+            "desc": "搜索列和返回列可以来自【不同数据源】，突破 VLOOKUP 必须在同一张表的限制。\n适合场景：两张飞书表格之间做关联查找。",
+            "source_title": "表A — 搜索列（供应商编码表）",
+            "source_cols": ["供应商编码", "供应商名称"],
+            "source_rows": [
+                ["V001", "华勤科技"],
+                ["V002", "富士康"],
+                ["V003", "立讯精密"],
+            ],
+            "lookup_title": "表B — 返回列（价格表，与表A行序对应）",
+            "lookup_items": ["表B：供应商编码 / 报价金额 / 交期(天)"],
+            "steps": [
+                ("查找值来源",   "你需要查找的供应商编码列表"),
+                ("搜索表",       "选「供应商编码表」→ 搜索列选「供应商编码」"),
+                ("返回表",       "选「价格表」→ 返回列选「报价金额」「交期」"),
+                ("匹配模式",     "精确匹配"),
+            ],
+            "result_cols": ["查找值", "报价金额", "交期(天)", "匹配状态"],
+            "result_rows": [
+                ["V001", "¥12,500", "30", "matched"],
+                ["V003", "¥9,800",  "45", "matched"],
+                ["V999", "#N/A",    "#N/A", "not_found"],
+            ],
+        },
+        {
+            "name": "INDEX/MATCH",
+            "desc": "MATCH 在一列中找到目标位置，INDEX 用该位置从另一列取值。\n两张表完全独立，最灵活，可跨任意表格任意列。",
+            "source_title": "MATCH 表（用来定位行号）",
+            "source_cols": ["物料编码", "物料描述"],
+            "source_rows": [
+                ["BOM-001", "主板组件"],
+                ["BOM-002", "电源模块"],
+                ["BOM-003", "散热风扇"],
+            ],
+            "lookup_title": "INDEX 表（从中取值，行序与 MATCH 表一致）",
+            "lookup_items": ["INDEX 表：物料编码 / 成本 / 重量(g)"],
+            "steps": [
+                ("查找值",       "要查的物料编码"),
+                ("MATCH 表",     "选「物料描述表」→ MATCH 列选「物料编码」"),
+                ("INDEX 表",     "选「成本表」→ INDEX 列选「成本」「重量」"),
+                ("匹配模式",     "精确 / 包含 均可"),
+            ],
+            "result_cols": ["查找值", "成本", "重量(g)", "匹配状态"],
+            "result_rows": [
+                ["BOM-001", "¥85.00", "320", "matched"],
+                ["BOM-003", "¥12.50",  "85", "matched"],
+                ["BOM-999", "#N/A",   "#N/A", "not_found"],
+            ],
+        },
+        {
+            "name": "SUMIF",
+            "desc": "对满足条件的行求某列的数值之和，同时展示哪些行被纳入了计算。\n适合场景：按供应商、按品类统计金额。",
+            "source_title": "数据表（采购记录）",
+            "source_cols": ["供应商", "品类", "金额"],
+            "source_rows": [
+                ["华勤",   "电子", "12000"],
+                ["富士康", "电子", "8500"],
+                ["华勤",   "机械", "3200"],
+                ["立讯",   "电子", "15000"],
+                ["华勤",   "电子", "6800"],
+            ],
+            "lookup_title": "参数配置",
+            "lookup_items": ["条件列：供应商", "条件值：华勤", "求和列：金额"],
+            "steps": [
+                ("数据源",   "选「采购记录表」"),
+                ("条件列",   "供应商"),
+                ("条件值",   "华勤（支持精确/包含/正则）"),
+                ("求和列",   "金额"),
+            ],
+            "result_cols": ["条件值", "求和结果", "匹配行数"],
+            "result_rows": [
+                ["华勤", "22000", "3（行1、行3、行5）"],
+            ],
+        },
+        {
+            "name": "COUNTIF",
+            "desc": "统计满足条件的行数，并展示哪些行被命中。\n适合场景：统计某供应商有多少条记录、某状态出现几次。",
+            "source_title": "数据表（订单状态表）",
+            "source_cols": ["订单号", "供应商", "状态"],
+            "source_rows": [
+                ["ORD-001", "华勤",   "已到货"],
+                ["ORD-002", "富士康", "在途"],
+                ["ORD-003", "华勤",   "已到货"],
+                ["ORD-004", "华勤",   "缺货"],
+                ["ORD-005", "立讯",   "已到货"],
+            ],
+            "lookup_title": "参数配置",
+            "lookup_items": ["条件列：供应商", "条件值：华勤"],
+            "steps": [
+                ("数据源",   "选「订单状态表」"),
+                ("条件列",   "供应商"),
+                ("条件值",   "华勤"),
+            ],
+            "result_cols": ["条件值", "计数", "命中行"],
+            "result_rows": [
+                ["华勤", "3", "ORD-001、ORD-003、ORD-004"],
+            ],
+        },
+        {
+            "name": "SUMIFS",
+            "desc": "多个条件同时满足时才求和，最多支持 4 个条件。\n适合场景：按供应商 + 品类 + 月份等多维度汇总。",
+            "source_title": "数据表（采购记录，含多列条件）",
+            "source_cols": ["供应商", "品类", "月份", "金额"],
+            "source_rows": [
+                ["华勤",   "电子", "1月", "12000"],
+                ["富士康", "电子", "1月",  "8500"],
+                ["华勤",   "机械", "1月",  "3200"],
+                ["华勤",   "电子", "2月",  "6800"],
+                ["华勤",   "电子", "1月",  "4500"],
+            ],
+            "lookup_title": "参数配置（2 个条件）",
+            "lookup_items": [
+                "条件1：供应商 = 华勤",
+                "条件2：品类 = 电子",
+                "条件3：月份 = 1月",
+                "求和列：金额",
+            ],
+            "steps": [
+                ("数据源",   "选「采购记录表」"),
+                ("求和列",   "金额"),
+                ("条件 1",   "供应商 = 华勤（精确匹配）"),
+                ("条件 2",   "品类 = 电子（精确匹配）"),
+                ("条件 3",   "月份 = 1月（精确匹配）"),
+            ],
+            "result_cols": ["条件组合", "求和结果", "命中行数"],
+            "result_rows": [
+                ["华勤 + 电子 + 1月", "16500", "2（行1、行5）"],
+            ],
+        },
+    ]
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, bg=COLORS["bg"], **kwargs)
+        self._build()
+
+    def _build(self):
+        tk.Label(self, text="使用示例",
+                 bg=COLORS["bg"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 13, "bold")).pack(
+                     anchor="w", padx=16, pady=(14, 2))
+        tk.Label(self,
+                 text="每个函数的典型使用场景、参数配置说明和预期结果展示",
+                 bg=COLORS["bg"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=16, pady=(0, 10))
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        for ex in self.EXAMPLES:
+            page = self._make_example_page(nb, ex)
+            nb.add(page, text=f"  {ex['name']}  ")
+
+    def _make_example_page(self, parent, ex: dict) -> tk.Frame:
+        outer = tk.Frame(parent, bg=COLORS["bg"])
+
+        canvas = tk.Canvas(outer, bg=COLORS["bg"], highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=COLORS["bg"])
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_configure(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        def _on_canvas_resize(e):
+            canvas.itemconfig(win_id, width=e.width)
+
+        inner.bind("<Configure>", _on_configure)
+        canvas.bind("<Configure>", _on_canvas_resize)
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+        pad = {"padx": 16, "pady": 6}
+
+        # ── 函数描述 ─────────────────────────────────────────────────────────
+        desc_card = make_card(inner)
+        desc_card.pack(fill="x", **pad)
+        tk.Label(desc_card, text=ex["name"], bg=COLORS["card"],
+                 fg=COLORS["accent"], font=("Microsoft YaHei UI", 12, "bold")
+                 ).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Label(desc_card, text=ex["desc"], bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 9),
+                 justify="left", wraplength=680
+                 ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        # ── 示例数据 ─────────────────────────────────────────────────────────
+        data_card = make_card(inner)
+        data_card.pack(fill="x", **pad)
+        tk.Label(data_card, text=ex["source_title"], bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 9, "bold")
+                 ).pack(anchor="w", padx=12, pady=(8, 4))
+
+        tree_frame = tk.Frame(data_card, bg=COLORS["card"])
+        tree_frame.pack(fill="x", padx=12, pady=(0, 4))
+        cols = ex["source_cols"]
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
+                            height=min(len(ex["source_rows"]), 5))
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=max(80, len(c)*14), anchor="center")
+        for row in ex["source_rows"]:
+            tree.insert("", "end", values=row)
+        tree.pack(fill="x")
+
+        # 查找值 / 额外说明
+        if ex.get("lookup_items"):
+            tk.Label(data_card, text=ex["lookup_title"], bg=COLORS["card"],
+                     fg=COLORS["text"], font=("Microsoft YaHei UI", 9, "bold")
+                     ).pack(anchor="w", padx=12, pady=(6, 2))
+            for item in ex["lookup_items"]:
+                tk.Label(data_card, text=f"  • {item}", bg=COLORS["card"],
+                         fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 9)
+                         ).pack(anchor="w", padx=12)
+        tk.Frame(data_card, height=8, bg=COLORS["card"]).pack()
+
+        # ── 参数配置步骤 ─────────────────────────────────────────────────────
+        step_card = make_card(inner)
+        step_card.pack(fill="x", **pad)
+        tk.Label(step_card, text="在「函数构建器」中这样配置",
+                 bg=COLORS["card"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold")
+                 ).pack(anchor="w", padx=12, pady=(8, 4))
+        for i, (label, detail) in enumerate(ex["steps"], 1):
+            row_f = tk.Frame(step_card, bg=COLORS["card"])
+            row_f.pack(fill="x", padx=12, pady=2)
+            tk.Label(row_f, text=f"  {i}.", bg=COLORS["card"],
+                     fg=COLORS["accent"], font=("Microsoft YaHei UI", 9, "bold"),
+                     width=3).pack(side="left")
+            tk.Label(row_f, text=label, bg=COLORS["card"],
+                     fg=COLORS["text"], font=("Microsoft YaHei UI", 9, "bold"),
+                     width=12, anchor="w").pack(side="left")
+            tk.Label(row_f, text=detail, bg=COLORS["card"],
+                     fg=COLORS["text_sub"], font=("Microsoft YaHei UI", 9),
+                     anchor="w").pack(side="left", fill="x", expand=True)
+        tk.Frame(step_card, height=8, bg=COLORS["card"]).pack()
+
+        # ── 预期结果 ─────────────────────────────────────────────────────────
+        res_card = make_card(inner)
+        res_card.pack(fill="x", **pad)
+        tk.Label(res_card, text="预期执行结果", bg=COLORS["card"],
+                 fg=COLORS["text"], font=("Microsoft YaHei UI", 9, "bold")
+                 ).pack(anchor="w", padx=12, pady=(8, 4))
+        res_frame = tk.Frame(res_card, bg=COLORS["card"])
+        res_frame.pack(fill="x", padx=12, pady=(0, 4))
+        rcols = ex["result_cols"]
+        rtree = ttk.Treeview(res_frame, columns=rcols, show="headings",
+                             height=len(ex["result_rows"]))
+        for c in rcols:
+            rtree.heading(c, text=c)
+            rtree.column(c, width=max(90, len(c)*14), anchor="center")
+        rtree.tag_configure("matched",   background="#e8f5e9", foreground="#2e7d32")
+        rtree.tag_configure("not_found", background="#ffebee", foreground="#c62828")
+        for row in ex["result_rows"]:
+            tag = row[-1] if row[-1] in ("matched", "not_found") else ""
+            display = row[:-1] if tag else row
+            rtree.insert("", "end", values=display, tags=(tag,))
+        rtree.pack(fill="x")
+        tk.Frame(res_card, height=8, bg=COLORS["card"]).pack()
+
+        return outer
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GUI 面板 6 — API 设置
 # ═════════════════════════════════════════════════════════════════════════════
 
 class SettingsPanel(tk.Frame):
@@ -3064,12 +3364,14 @@ class FeishuFormulaApp(tk.Tk):
             on_sources_changed=self._on_sources_changed
         )
         self.editor_panel   = OnlineEditorPanel(self.nb, self.cache, self.api)
+        self.examples_panel = ExamplesPanel(self.nb)
         self.settings_panel = SettingsPanel(self.nb, self.cache, self.api)
 
         self.nb.add(self.source_panel,   text="  数据源管理  ")
         self.nb.add(self.builder_panel,  text="  函数构建器  ")
         self.nb.add(self.results_panel,  text="  执行结果    ")
         self.nb.add(self.editor_panel,   text="  在线编辑    ")
+        self.nb.add(self.examples_panel, text="  使用示例    ")
         self.nb.add(self.settings_panel, text="  API 设置    ")
 
     def _on_results(self, headers, rows, func_type):
