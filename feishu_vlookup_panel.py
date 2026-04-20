@@ -189,6 +189,8 @@ class FeishuAPIClient:
                            values: list[list],
                            start_row: int = 0, start_col: int = 0) -> dict:
         """内网代理写入（行列均 0-based，0 行为表头行）"""
+        if not values:
+            return {}
         url  = f"{self.base_url}/fs/sheet/v1/setSheetsValue"
         body = {
             "spreadsheetToken": token,
@@ -2154,16 +2156,12 @@ class ResultsPanel(tk.Frame):
                        bg=COLORS["warning"]).pack(side="left", padx=4)
 
         # 显示模式
-        self._show_all = tk.BooleanVar(value=True)
-        self._show_match = tk.BooleanVar(value=True)
-        self._show_nomatch = tk.BooleanVar(value=True)
+        self._filter_mode = tk.StringVar(value="all")
         filter_frame = tk.Frame(bot, bg=COLORS["bg"])
         filter_frame.pack(side="right")
-        for text, var in [("全部", self._show_all),
-                           ("仅匹配", self._show_match),
-                           ("仅未匹配", self._show_nomatch)]:
-            ttk.Radiobutton(filter_frame, text=text, variable=self._show_all,
-                            value=(text == "全部"),
+        for text, val in [("全部", "all"), ("仅匹配", "match"), ("仅未匹配", "nomatch")]:
+            ttk.Radiobutton(filter_frame, text=text, variable=self._filter_mode,
+                            value=val,
                             command=self._apply_filter).pack(side="left", padx=4)
 
     def show_results(self, headers: list[str], rows: list[list[str]],
@@ -2189,10 +2187,18 @@ class ResultsPanel(tk.Frame):
 
     def _apply_filter(self, *_):
         kw   = self._search_var.get().strip().lower()
+        mode = self._filter_mode.get()
         rows = self._rows
 
         if kw:
             rows = [r for r in rows if any(kw in str(v).lower() for v in r)]
+
+        if mode != "all" and self._status_col is not None:
+            sc = self._status_col
+            if mode == "match":
+                rows = [r for r in rows if sc < len(r) and r[sc] == "MATCH"]
+            elif mode == "nomatch":
+                rows = [r for r in rows if sc < len(r) and r[sc] != "MATCH"]
 
         self._filtered = rows
         self._render_table()
@@ -2423,6 +2429,9 @@ class ResultsPanel(tk.Frame):
             except Exception:
                 messagebox.showerror("错误", "无法解析目标数据源", parent=dlg)
                 return
+            if not src:
+                messagebox.showerror("错误", "目标数据源已不存在，请重新选择", parent=dlg)
+                return
 
             wb_status.set(f"正在写入 {len(write_rows)} 行 × {len(chosen_cols)} 列...")
             dlg.update_idletasks()
@@ -2478,6 +2487,7 @@ class OnlineEditorPanel(tk.Frame):
         self._dirty:  dict[tuple[int,int], str] = {}  # {(row_idx, col_idx): new_val}
         self._col_count = 0
         self._editing_entry: tk.Entry | None = None
+        self._iid_to_row: dict[str, int] = {}
 
         self._build_ui()
         self._reload_source_list()
@@ -3091,14 +3101,22 @@ class ExamplesPanel(tk.Frame):
         win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
 
         def _on_configure(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=bbox)
         def _on_canvas_resize(e):
             canvas.itemconfig(win_id, width=e.width)
 
+        def _bind_scroll(e):
+            canvas.bind_all("<MouseWheel>",
+                            lambda ev: canvas.yview_scroll(-1*(ev.delta//120), "units"))
+        def _unbind_scroll(e):
+            canvas.unbind_all("<MouseWheel>")
+
         inner.bind("<Configure>", _on_configure)
         canvas.bind("<Configure>", _on_canvas_resize)
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
+        canvas.bind("<Enter>", _bind_scroll)
+        canvas.bind("<Leave>", _unbind_scroll)
 
         pad = {"padx": 16, "pady": 6}
 
