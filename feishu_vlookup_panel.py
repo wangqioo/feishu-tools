@@ -1092,13 +1092,11 @@ class DataSourcePanel(tk.Frame):
 
         # ── 在线飞书表格参数 ──────────────────────────────────────────────────
         ol = {}  # online vars
-        ol_fields = [
-            ("数据源名称 *", "name",       "拉取工作表后自动填入表格标题，也可手动修改"),
-            ("表格 Token *", "token",      "可直接粘贴飞书表格链接，自动提取 Token"),
-            ("工作表 ID",    "sheet_id",   "留空后点「拉取工作表列表」自动填入"),
-            ("工作表名称",   "sheet_title","可选，便于识别"),
+        _simple_fields = [
+            ("数据源名称 *", "name",  "拉取工作表后自动填入表格标题，也可手动修改"),
+            ("表格 Token *", "token", "可直接粘贴飞书表格链接，自动提取 Token"),
         ]
-        for ri, (label, key, hint) in enumerate(ol_fields):
+        for ri, (label, key, hint) in enumerate(_simple_fields):
             tk.Label(online_frame, text=label, bg=COLORS["card"],
                      fg=COLORS["text"],
                      font=("Microsoft YaHei UI", 9, "bold"),
@@ -1112,6 +1110,35 @@ class DataSourcePanel(tk.Frame):
                      fg=COLORS["text_sub"],
                      font=("Microsoft YaHei UI", 7)).grid(
                          row=ri*2+1, column=1, padx=4, sticky="w")
+
+        # 工作表下拉选择（拉取后填充）
+        base_row = len(_simple_fields) * 2
+        tk.Label(online_frame, text="工作表 *", bg=COLORS["card"],
+                 fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 9, "bold"),
+                 width=14, anchor="e").grid(
+                     row=base_row, column=0, padx=(12, 4), pady=(8, 0))
+        ol["sheet_id"]    = tk.StringVar()
+        ol["sheet_title"] = tk.StringVar()
+        ol["_sheets_data"] = []   # list of {sheet_id, sheet_title}
+        sheet_cb = ttk.Combobox(online_frame, width=43, state="readonly")
+        sheet_cb.grid(row=base_row, column=1, padx=4, pady=(8, 0), sticky="ew")
+        ol["sheet_cb"] = sheet_cb
+        tk.Label(online_frame, text="先填写 Token 再点「拉取工作表列表」",
+                 bg=COLORS["card"], fg=COLORS["text_sub"],
+                 font=("Microsoft YaHei UI", 7)).grid(
+                     row=base_row+1, column=1, padx=4, sticky="w")
+
+        def _on_sheet_select(event=None):
+            idx = sheet_cb.current()
+            if idx < 0:
+                return
+            sheets_data = ol["_sheets_data"]
+            if idx < len(sheets_data):
+                s = sheets_data[idx]
+                ol["sheet_id"].set(s["sheet_id"])
+                ol["sheet_title"].set(s["sheet_title"])
+        sheet_cb.bind("<<ComboboxSelected>>", _on_sheet_select)
 
         # Token 输入框：粘贴飞书链接时自动提取 token
         def _on_token_change(*_):
@@ -1245,6 +1272,13 @@ class DataSourcePanel(tk.Frame):
                 if not sheets:
                     log_var.set("未找到工作表，请检查 Token 或权限")
                     return
+                # 填充下拉列表
+                ol["_sheets_data"] = sheets
+                cb = ol["sheet_cb"]
+                cb["values"] = [
+                    f"{s['sheet_title']}  ({s['sheet_id']})" for s in sheets
+                ]
+                cb.current(0)
                 ol["sheet_id"].set(sheets[0]["sheet_id"])
                 ol["sheet_title"].set(sheets[0]["sheet_title"])
                 # 自动填入数据源名称（表格标题 > 第一个工作表名，仅当名称栏为空时）
@@ -1253,8 +1287,7 @@ class DataSourcePanel(tk.Frame):
                     if auto_name:
                         ol["name"].set(auto_name)
                 log_var.set(
-                    f"发现 {len(sheets)} 个工作表，已填入第一个: "
-                    f"{sheets[0]['sheet_title']}")
+                    f"发现 {len(sheets)} 个工作表，请在下拉列表中选择要导入的工作表")
             except Exception as ex:
                 title, detail = _format_api_error(ex)
                 log_var.set(f"失败: {title}")
