@@ -153,11 +153,11 @@ class FeishuAPIClient:
     def fetch_meta(self, token: str, use_open_api: bool = False) -> list[dict]:
         """返回 [{sheet_id, sheet_title}, ...]"""
         if use_open_api:
-            data   = self.get_sheet_meta_open(token)
+            data   = self.get_sheet_meta_open(token) or {}
             sheets = data.get("data", {}).get("sheets", [])
             return [{"sheet_id": s["sheet_id"], "sheet_title": s["title"]} for s in sheets]
         else:
-            data   = self.get_sheet_meta_proxy(token)
+            data   = self.get_sheet_meta_proxy(token) or {}
             sheets = data.get("data", {}).get("sheets", [])
             return [{"sheet_id": s.get("sheetId", ""), "sheet_title": s.get("title", "")}
                     for s in sheets]
@@ -167,10 +167,10 @@ class FeishuAPIClient:
                      max_rows: int = 5000) -> list[list]:
         """返回二维列表 rows[row][col]"""
         if use_open_api:
-            data = self.get_sheet_values_open(token, sheet_id)
+            data = self.get_sheet_values_open(token, sheet_id) or {}
             return data.get("data", {}).get("valueRange", {}).get("values", [])
         else:
-            data = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows)
+            data = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows) or {}
             return data.get("data", {}).get("values", [])
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
