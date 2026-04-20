@@ -150,17 +150,27 @@ class FeishuAPIClient:
 
     # ── 统一调用（根据配置自动选择） ──────────────────────────────────────────
 
-    def fetch_meta(self, token: str, use_open_api: bool = False) -> list[dict]:
-        """返回 [{sheet_id, sheet_title}, ...]"""
+    def fetch_meta(self, token: str, use_open_api: bool = False
+                   ) -> tuple[list[dict], str]:
+        """返回 (sheets, spreadsheet_title)
+        sheets: [{sheet_id, sheet_title}, ...]
+        spreadsheet_title: 整个表格的标题
+        """
         if use_open_api:
             data   = self.get_sheet_meta_open(token) or {}
-            sheets = data.get("data", {}).get("sheets", [])
-            return [{"sheet_id": s["sheet_id"], "sheet_title": s["title"]} for s in sheets]
+            inner  = data.get("data", {})
+            sheets = inner.get("sheets", [])
+            sp_title = inner.get("title", "")
+            return ([{"sheet_id": s["sheet_id"], "sheet_title": s["title"]} for s in sheets],
+                    sp_title)
         else:
             data   = self.get_sheet_meta_proxy(token) or {}
-            sheets = data.get("data", {}).get("sheets", [])
-            return [{"sheet_id": s.get("sheetId", ""), "sheet_title": s.get("title", "")}
-                    for s in sheets]
+            inner  = data.get("data", {})
+            sheets = inner.get("sheets", [])
+            sp_title = inner.get("title", "")
+            return ([{"sheet_id": s.get("sheetId", ""), "sheet_title": s.get("title", "")}
+                     for s in sheets],
+                    sp_title)
 
     def fetch_values(self, token: str, sheet_id: str,
                      use_open_api: bool = False,
@@ -1067,8 +1077,8 @@ class DataSourcePanel(tk.Frame):
         # ── 在线飞书表格参数 ──────────────────────────────────────────────────
         ol = {}  # online vars
         ol_fields = [
-            ("数据源名称 *", "name",       "给这个数据源起个名字，如「物料库2024」"),
-            ("表格 Token *", "token",      "飞书表格 URL 中的 token 参数"),
+            ("数据源名称 *", "name",       "拉取工作表后自动填入表格标题，也可手动修改"),
+            ("表格 Token *", "token",      "可直接粘贴飞书表格链接，自动提取 Token"),
             ("工作表 ID",    "sheet_id",   "留空后点「拉取工作表列表」自动填入"),
             ("工作表名称",   "sheet_title","可选，便于识别"),
         ]
@@ -1086,6 +1096,18 @@ class DataSourcePanel(tk.Frame):
                      fg=COLORS["text_sub"],
                      font=("Microsoft YaHei UI", 7)).grid(
                          row=ri*2+1, column=1, padx=4, sticky="w")
+
+        # Token 输入框：粘贴飞书链接时自动提取 token
+        def _on_token_change(*_):
+            val = ol["token"].get().strip()
+            if "feishu.cn" in val or "larksuite.com" in val:
+                import re
+                m = re.search(
+                    r'(?:feishu\.cn|larksuite\.com)/(?:sheets|base|wiki|docs|docx)/([A-Za-z0-9_-]+)',
+                    val)
+                if m:
+                    ol["token"].set(m.group(1))
+        ol["token"].trace_add("write", _on_token_change)
 
         # API 模式
         use_open = tk.BooleanVar(value=False)
@@ -1203,12 +1225,17 @@ class DataSourcePanel(tk.Frame):
             log_var.set("正在拉取工作表列表...")
             dlg.update_idletasks()
             try:
-                sheets = self.api.fetch_meta(token, use_open_api=use_open.get())
+                sheets, sp_title = self.api.fetch_meta(token, use_open_api=use_open.get())
                 if not sheets:
                     log_var.set("未找到工作表，请检查 Token 或权限")
                     return
                 ol["sheet_id"].set(sheets[0]["sheet_id"])
                 ol["sheet_title"].set(sheets[0]["sheet_title"])
+                # 自动填入数据源名称（表格标题 > 第一个工作表名，仅当名称栏为空时）
+                if not ol["name"].get().strip():
+                    auto_name = sp_title or sheets[0]["sheet_title"]
+                    if auto_name:
+                        ol["name"].set(auto_name)
                 log_var.set(
                     f"发现 {len(sheets)} 个工作表，已填入第一个: "
                     f"{sheets[0]['sheet_title']}")
