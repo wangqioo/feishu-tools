@@ -1273,17 +1273,20 @@ class DataSourcePanel(tk.Frame):
                         source_type="online",
                     )
                     self.cache.store_rows(src_id, rows)
-                    dlg.after(0, lambda: log_var.set(
-                        f"完成！共拉取 {len(rows)} 行数据"))
-                    dlg.after(100, lambda: [
-                        self.refresh_table(),
-                        self.on_change and self.on_change(),
-                    ])
+                    n = len(rows)
+                    def _ok_online(n=n):
+                        if not dlg.winfo_exists(): return
+                        log_var.set(f"完成！共拉取 {n} 行数据")
+                        self.refresh_table()
+                        if self.on_change: self.on_change()
+                    dlg.after(0, _ok_online)
                 except Exception as ex:
                     err_title, err_detail = _format_api_error(ex)
-                    dlg.after(0, lambda: log_var.set(f"失败: {err_title}"))
-                    dlg.after(0, lambda: messagebox.showerror(
-                        err_title, err_detail, parent=dlg))
+                    def _err_online(t=err_title, d=err_detail):
+                        if not dlg.winfo_exists(): return
+                        log_var.set(f"失败: {t}")
+                        messagebox.showerror(t, d, parent=dlg)
+                    dlg.after(0, _err_online)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -1319,17 +1322,19 @@ class DataSourcePanel(tk.Frame):
                         source_type="local",
                     )
                     self.cache.store_rows(src_id, rows)
-                    dlg.after(0, lambda: log_var.set(
-                        f"完成！共读取 {len(rows)} 行数据"))
-                    dlg.after(100, lambda: [
-                        self.refresh_table(),
-                        self.on_change and self.on_change(),
-                    ])
+                    n = len(rows)
+                    def _ok_local(n=n):
+                        if not dlg.winfo_exists(): return
+                        log_var.set(f"完成！共读取 {n} 行数据")
+                        self.refresh_table()
+                        if self.on_change: self.on_change()
+                    dlg.after(0, _ok_local)
                 except Exception as ex:
-                    dlg.after(0, lambda e=ex: [
-                        log_var.set(f"读取失败: {e}"),
-                        messagebox.showerror("读取失败", str(e), parent=dlg),
-                    ])
+                    def _err_local(e=ex):
+                        if not dlg.winfo_exists(): return
+                        log_var.set(f"读取失败: {e}")
+                        messagebox.showerror("读取失败", str(e), parent=dlg)
+                    dlg.after(0, _err_local)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -1912,14 +1917,83 @@ class FunctionBuilderPanel(tk.Frame):
 
     # ── 执行函数 ───────────────────────────────────────────────────────────────
 
+    def _collect_ui_params(self, fname: str) -> dict:
+        """在主线程中收集所有 tkinter 控件的当前值，线程只接收纯 Python 数据。"""
+        p = {"fname": fname}
+        def _lb_sel(lb_key, var_dict):
+            lb  = var_dict[lb_key]
+            sel = list(lb.curselection())
+            return [int(lb.get(i).split(":")[0]) for i in sel]
+
+        if fname == "VLOOKUP":
+            p["lv_src"]     = self._vl["lv_src"].get()
+            p["tbl_src"]    = self._vl["tbl_src"].get()
+            p["lv_col"]     = self._col_idx_from_var(self._vl["lv_col"])
+            p["key_col"]    = self._col_idx_from_var(self._vl["key_col"])
+            p["match_mode"] = self._vl["match_mode"].get()
+            p["not_found"]  = self._vl["not_found"].get()
+            p["ret_cols"]   = _lb_sel("ret_lb", self._vl)
+        elif fname == "XLOOKUP":
+            p["lv_src"]     = self._xl["lv_src"].get()
+            p["search_src"] = self._xl["search_src"].get()
+            p["return_src"] = self._xl["return_src"].get()
+            p["lv_col"]     = self._col_idx_from_var(self._xl["lv_col"])
+            p["search_col"] = self._col_idx_from_var(self._xl["search_col"])
+            p["match_mode"] = self._xl["match_mode"].get()
+            p["not_found"]  = self._xl["not_found"].get()
+            p["ret_cols"]   = _lb_sel("ret_lb", self._xl)
+        elif fname == "INDEX/MATCH":
+            p["lv_src"]     = self._im["lv_src"].get()
+            p["match_src"]  = self._im["match_src"].get()
+            p["index_src"]  = self._im["index_src"].get()
+            p["lv_col"]     = self._col_idx_from_var(self._im["lv_col"])
+            p["match_col"]  = self._col_idx_from_var(self._im["match_col"])
+            p["index_col"]  = self._col_idx_from_var(self._im["index_col"])
+            p["match_mode"] = self._im["match_mode"].get()
+            p["not_found"]  = self._im["not_found"].get()
+        elif fname == "SUMIF":
+            p["tbl_src"]      = self._si["tbl_src"].get()
+            p["criteria_col"] = self._col_idx_from_var(self._si["criteria_col"])
+            p["sum_col"]      = self._col_idx_from_var(self._si["sum_col"])
+            p["criteria"]     = self._si["criteria"].get().strip()
+            p["match_mode"]   = self._si["match_mode"].get()
+        elif fname == "COUNTIF":
+            p["tbl_src"]      = self._ci["tbl_src"].get()
+            p["criteria_col"] = self._col_idx_from_var(self._ci["criteria_col"])
+            p["criteria"]     = self._ci["criteria"].get().strip()
+            p["match_mode"]   = self._ci["match_mode"].get()
+        elif fname == "SUMIFS":
+            p["tbl_src"] = self._sifs["tbl_src"].get()
+            p["sum_col"] = self._col_idx_from_var(self._sifs["sum_col"])
+            conds = []
+            for i in range(4):
+                crit = self._sifs[f"cond{i}_crit"].get().strip()
+                if not crit:
+                    continue
+                conds.append({
+                    "col":      self._col_idx_from_var(self._sifs[f"cond{i}_col"]),
+                    "criteria": crit,
+                    "mode":     self._sifs[f"cond{i}_mode"].get(),
+                })
+            p["conds"] = conds
+        return p
+
     def _run_function(self):
         fname = self._func_var.get()
         self._run_info.config(text="执行中...", fg=COLORS["warning"])
         self.update_idletasks()
 
+        # 在主线程收集所有 UI 值，子线程不接触任何 tkinter 控件
+        try:
+            params = self._collect_ui_params(fname)
+        except Exception as ex:
+            self._run_info.config(text=f"错误: {ex}", fg=COLORS["error"])
+            messagebox.showerror("参数错误", str(ex), parent=self)
+            return
+
         def worker():
             try:
-                headers, rows, status_col = self._execute(fname)
+                headers, rows, status_col = self._execute(params)
                 self.after(0, lambda: self._run_info.config(
                     text=f"完成  共 {len(rows)} 行结果", fg=COLORS["success"]))
                 if self.on_results:
@@ -1932,89 +2006,63 @@ class FunctionBuilderPanel(tk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _get_source_rows(self, var: tk.StringVar) -> list[list[str]]:
-        src = self._source_by_choice(var.get())
-        if not src:
-            raise ValueError(f"请选择数据源（当前: {var.get()!r}）")
-        if not src.get("synced_at"):
-            raise ValueError(f"数据源「{src['name']}」尚未同步，请先同步")
-        return self._get_rows(src["id"])
-
-    def _execute(self, fname: str):
+    def _execute(self, p: dict):
+        """线程安全：接收主线程已收集好的纯 Python 参数字典，不访问任何 tkinter 控件。"""
+        fname  = p["fname"]
         engine = FormulaEngine()
 
+        def get_rows(choice: str) -> list[list[str]]:
+            src = self._source_by_choice(choice)
+            if not src:
+                raise ValueError(f"请选择数据源（当前: {choice!r}）")
+            if not src.get("synced_at"):
+                raise ValueError(f"数据源「{src['name']}」尚未同步，请先同步")
+            return self._get_rows(src["id"])
+
         if fname == "VLOOKUP":
-            lv_rows  = self._get_source_rows(self._vl["lv_src"])
-            tbl_rows = self._get_source_rows(self._vl["tbl_src"])
-            lv_col   = self._col_idx_from_var(self._vl["lv_col"])
-            key_col  = self._col_idx_from_var(self._vl["key_col"])
-            mode     = self._vl["match_mode"].get()
-            not_f    = self._vl["not_found"].get()
-
-            # 获取选中的返回列
-            sel = list(self._vl["ret_lb"].curselection())
-            if not sel:
+            lv_rows  = get_rows(p["lv_src"])
+            tbl_rows = get_rows(p["tbl_src"])
+            lv_col, key_col = p["lv_col"], p["key_col"]
+            mode, not_f, ret_cols = p["match_mode"], p["not_found"], p["ret_cols"]
+            if not ret_cols:
                 raise ValueError("请至少选择一个返回列")
-            ret_cols = [int(self._vl["ret_lb"].get(i).split(":")[0]) for i in sel]
-
-            # 取查找值列
-            lv_list = [str(r[lv_col]) if lv_col < len(r) else "" for r in lv_rows[1:]]
-
-            results = engine.vlookup(lv_list, tbl_rows, key_col, ret_cols, mode, not_f)
-
+            lv_list  = [str(r[lv_col]) if lv_col < len(r) else "" for r in lv_rows[1:]]
+            results  = engine.vlookup(lv_list, tbl_rows, key_col, ret_cols, mode, not_f)
             tbl_hdr  = tbl_rows[0] if tbl_rows else []
             ret_hdrs = [tbl_hdr[c] if c < len(tbl_hdr) else f"列{c}" for c in ret_cols]
-            lv_hdr   = (lv_rows[0][lv_col] if lv_rows and lv_col < len(lv_rows[0]) else "查找值")
+            lv_hdr   = lv_rows[0][lv_col] if lv_rows and lv_col < len(lv_rows[0]) else "查找值"
             headers  = [lv_hdr] + ret_hdrs + ["匹配状态"]
-
-            out_rows = []
-            for r in results:
-                row = [r["__lookup_value__"]]
-                row += [r.get(f"col_{c}", not_f) for c in ret_cols]
-                row += [r["__status__"]]
-                out_rows.append(row)
+            out_rows = [[r["__lookup_value__"]] +
+                        [r.get(f"col_{c}", not_f) for c in ret_cols] +
+                        [r["__status__"]] for r in results]
             return headers, out_rows, len(headers) - 1
 
         elif fname == "XLOOKUP":
-            lv_rows     = self._get_source_rows(self._xl["lv_src"])
-            search_rows = self._get_source_rows(self._xl["search_src"])
-            return_rows = self._get_source_rows(self._xl["return_src"])
-            lv_col      = self._col_idx_from_var(self._xl["lv_col"])
-            search_col  = self._col_idx_from_var(self._xl["search_col"])
-            mode        = self._xl["match_mode"].get()
-            not_f       = self._xl["not_found"].get()
-
-            sel = list(self._xl["ret_lb"].curselection())
-            if not sel:
+            lv_rows     = get_rows(p["lv_src"])
+            search_rows = get_rows(p["search_src"])
+            return_rows = get_rows(p["return_src"])
+            lv_col, search_col = p["lv_col"], p["search_col"]
+            mode, not_f, ret_cols = p["match_mode"], p["not_found"], p["ret_cols"]
+            if not ret_cols:
                 raise ValueError("请至少选择一个返回列")
-            ret_cols = [int(self._xl["ret_lb"].get(i).split(":")[0]) for i in sel]
             lv_list  = [str(r[lv_col]) if lv_col < len(r) else "" for r in lv_rows[1:]]
-
             results  = engine.xlookup(lv_list, search_rows, search_col,
                                       return_rows, ret_cols, mode, not_f)
             ret_hdr  = return_rows[0] if return_rows else []
             ret_hdrs = [ret_hdr[c] if c < len(ret_hdr) else f"列{c}" for c in ret_cols]
             lv_hdr   = lv_rows[0][lv_col] if lv_rows and lv_col < len(lv_rows[0]) else "查找值"
             headers  = [lv_hdr] + ret_hdrs + ["匹配状态"]
-
-            out_rows = []
-            for r in results:
-                row = [r["__lookup_value__"]]
-                row += [r.get(f"col_{c}", not_f) for c in ret_cols]
-                row += [r["__status__"]]
-                out_rows.append(row)
+            out_rows = [[r["__lookup_value__"]] +
+                        [r.get(f"col_{c}", not_f) for c in ret_cols] +
+                        [r["__status__"]] for r in results]
             return headers, out_rows, len(headers) - 1
 
         elif fname == "INDEX/MATCH":
-            lv_rows     = self._get_source_rows(self._im["lv_src"])
-            match_rows  = self._get_source_rows(self._im["match_src"])
-            index_rows  = self._get_source_rows(self._im["index_src"])
-            lv_col      = self._col_idx_from_var(self._im["lv_col"])
-            match_col   = self._col_idx_from_var(self._im["match_col"])
-            index_col   = self._col_idx_from_var(self._im["index_col"])
-            mode        = self._im["match_mode"].get()
-            not_f       = self._im["not_found"].get()
-
+            lv_rows    = get_rows(p["lv_src"])
+            match_rows = get_rows(p["match_src"])
+            index_rows = get_rows(p["index_src"])
+            lv_col, match_col, index_col = p["lv_col"], p["match_col"], p["index_col"]
+            mode, not_f = p["match_mode"], p["not_found"]
             lv_list  = [str(r[lv_col]) if lv_col < len(r) else "" for r in lv_rows[1:]]
             results  = engine.index_match(lv_list, match_rows, match_col,
                                           index_rows, index_col, mode, not_f)
@@ -2022,32 +2070,26 @@ class FunctionBuilderPanel(tk.Frame):
             ret_name = idx_hdr[index_col] if index_col < len(idx_hdr) else f"列{index_col}"
             lv_hdr   = lv_rows[0][lv_col] if lv_rows and lv_col < len(lv_rows[0]) else "查找值"
             headers  = [lv_hdr, ret_name, "匹配行号", "匹配状态"]
-
             out_rows = [[r["__lookup_value__"], r["result"],
-                         str(r.get("_row_idx", "")), r["__status__"]]
-                        for r in results]
+                         str(r.get("_row_idx", "")), r["__status__"]] for r in results]
             return headers, out_rows, 3
 
         elif fname == "SUMIF":
-            tbl_rows     = self._get_source_rows(self._si["tbl_src"])
-            criteria_col = self._col_idx_from_var(self._si["criteria_col"])
-            sum_col      = self._col_idx_from_var(self._si["sum_col"])
-            criteria     = self._si["criteria"].get().strip()
-            mode         = self._si["match_mode"].get()
-
+            tbl_rows     = get_rows(p["tbl_src"])
+            criteria_col = p["criteria_col"]
+            sum_col      = p["sum_col"]
+            criteria     = p["criteria"]
+            mode         = p["match_mode"]
             if not criteria:
                 raise ValueError("请填写条件值")
-
             result    = engine.sumif(tbl_rows, criteria_col, criteria, sum_col, mode)
             tbl_hdr   = tbl_rows[0] if tbl_rows else []
             sum_name  = tbl_hdr[sum_col] if sum_col < len(tbl_hdr) else f"列{sum_col}"
             crit_name = tbl_hdr[criteria_col] if criteria_col < len(tbl_hdr) else f"列{criteria_col}"
-
-            # 汇总行 + 明细行
-            headers  = [crit_name, sum_name] + [h for h in tbl_hdr if h != sum_name and h != crit_name]
-            sum_row  = [f"[合计]  条件: {criteria}", str(result["sum"])] + [""]*(len(headers)-2)
-            cnt_row  = [f"[匹配行数: {result['count']}]", ""] + [""]*(len(headers)-2)
-            out_rows = [sum_row, cnt_row]
+            headers   = [crit_name, sum_name] + [h for h in tbl_hdr if h != sum_name and h != crit_name]
+            sum_row   = [f"[合计]  条件: {criteria}", str(result["sum"])] + [""]*(len(headers)-2)
+            cnt_row   = [f"[匹配行数: {result['count']}]", ""] + [""]*(len(headers)-2)
+            out_rows  = [sum_row, cnt_row]
             for r in result["matched_rows"]:
                 padded = r + [""] * (len(headers) - len(r))
                 out_rows.append([padded[criteria_col], padded[sum_col]] +
@@ -2055,14 +2097,12 @@ class FunctionBuilderPanel(tk.Frame):
             return headers, out_rows, None
 
         elif fname == "COUNTIF":
-            tbl_rows     = self._get_source_rows(self._ci["tbl_src"])
-            criteria_col = self._col_idx_from_var(self._ci["criteria_col"])
-            criteria     = self._ci["criteria"].get().strip()
-            mode         = self._ci["match_mode"].get()
-
+            tbl_rows     = get_rows(p["tbl_src"])
+            criteria_col = p["criteria_col"]
+            criteria     = p["criteria"]
+            mode         = p["match_mode"]
             if not criteria:
                 raise ValueError("请填写条件值")
-
             result    = engine.countif(tbl_rows, criteria_col, criteria, mode)
             tbl_hdr   = tbl_rows[0] if tbl_rows else []
             crit_name = tbl_hdr[criteria_col] if criteria_col < len(tbl_hdr) else f"列{criteria_col}"
@@ -2074,19 +2114,11 @@ class FunctionBuilderPanel(tk.Frame):
             return headers, out_rows, None
 
         elif fname == "SUMIFS":
-            tbl_rows = self._get_source_rows(self._sifs["tbl_src"])
-            sum_col  = self._col_idx_from_var(self._sifs["sum_col"])
-            conds    = []
-            for i in range(4):
-                crit = self._sifs[f"cond{i}_crit"].get().strip()
-                if not crit:
-                    continue
-                col  = self._col_idx_from_var(self._sifs[f"cond{i}_col"])
-                mode = self._sifs[f"cond{i}_mode"].get()
-                conds.append({"col": col, "criteria": crit, "mode": mode})
+            tbl_rows = get_rows(p["tbl_src"])
+            sum_col  = p["sum_col"]
+            conds    = p["conds"]
             if not conds:
                 raise ValueError("请至少填写一个条件")
-
             result   = engine.sumifs(tbl_rows, sum_col, conds)
             tbl_hdr  = tbl_rows[0] if tbl_rows else []
             headers  = tbl_hdr if tbl_hdr else [f"列{i}" for i in range(
@@ -2466,6 +2498,9 @@ class ResultsPanel(tk.Frame):
             wb_status.set(f"正在写入 {len(write_rows)} 行 × {len(chosen_cols)} 列...")
             dlg.update_idletasks()
 
+            n = len(write_rows)
+            src_name = src["name"]
+
             def worker():
                 try:
                     self.api.write_values(
@@ -2473,17 +2508,17 @@ class ResultsPanel(tk.Frame):
                         start_row=start_row, start_col=start_col,
                         use_open_api=bool(src["use_open_api"]),
                     )
-                    dlg.after(0, lambda: [
-                        wb_status.set(f"写入成功！共 {len(write_rows)} 行"),
-                        messagebox.showinfo("成功",
-                                            f"已写入 {len(write_rows)} 行到\n{src['name']}",
-                                            parent=dlg),
-                    ])
+                    def _ok():
+                        if not dlg.winfo_exists(): return
+                        wb_status.set(f"写入成功！共 {n} 行")
+                        messagebox.showinfo("成功", f"已写入 {n} 行到\n{src_name}", parent=dlg)
+                    dlg.after(0, _ok)
                 except Exception as ex:
-                    dlg.after(0, lambda e=ex: [
-                        wb_status.set(f"写入失败: {e}"),
-                        messagebox.showerror("写入失败", str(e), parent=dlg),
-                    ])
+                    def _err(e=ex):
+                        if not dlg.winfo_exists(): return
+                        wb_status.set(f"写入失败: {e}")
+                        messagebox.showerror("写入失败", str(e), parent=dlg)
+                    dlg.after(0, _err)
 
             threading.Thread(target=worker, daemon=True).start()
 
