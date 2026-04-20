@@ -2912,7 +2912,7 @@ class SettingsPanel(tk.Frame):
 
         fields = [
             ("内网代理地址", "proxy_url",
-             "默认: https://mcenter.huaqin.com  (留空使用默认值)"),
+             f"默认: {FeishuAPIClient.DEFAULT_PROXY}"),
             ("App ID",       "app_id",
              f"默认: {FeishuAPIClient.DEFAULT_APP_ID}"),
             ("User ID",      "user_id",
@@ -2960,7 +2960,7 @@ class SettingsPanel(tk.Frame):
 
     def _load_config(self):
         cfg = self.cache.load_api_config()
-        self._vars["proxy_url"].set(    cfg.get("proxy_url",     ""))
+        self._vars["proxy_url"].set(    cfg.get("proxy_url",     FeishuAPIClient.DEFAULT_PROXY))
         self._vars["app_id"].set(       cfg.get("app_id",        FeishuAPIClient.DEFAULT_APP_ID))
         self._vars["user_id"].set(      cfg.get("user_id",       ""))
         self._vars["access_token"].set( cfg.get("access_token",  ""))
@@ -2972,7 +2972,7 @@ class SettingsPanel(tk.Frame):
         messagebox.showinfo("已保存", "设置已保存", parent=self)
 
     def _reset_defaults(self):
-        self._vars["proxy_url"].set("")
+        self._vars["proxy_url"].set(FeishuAPIClient.DEFAULT_PROXY)
         self._vars["app_id"].set(FeishuAPIClient.DEFAULT_APP_ID)
         self._vars["user_id"].set("")
         self._vars["access_token"].set("")
