@@ -86,12 +86,13 @@ COLORS = {
 class FeishuAPIClient:
     """飞书表格数据接口（兼容企业内网代理和官方 API）"""
 
-    DEFAULT_PROXY = "https://mcenter.huaqin.com"
+    DEFAULT_PROXY  = "https://mcenter.huaqin.com"
+    DEFAULT_APP_ID = "cli_a96ac38049f8d0e5"
 
     def __init__(self, base_url: str = None, app_id: str = None, user_id: str = None,
                  access_token: str = None):
         self.base_url     = (base_url or self.DEFAULT_PROXY).rstrip("/")
-        self.app_id       = app_id    or "cli_a96ac38049f8d0e5"
+        self.app_id       = app_id    or self.DEFAULT_APP_ID
         self.user_id      = user_id   or ""
         self.access_token = access_token or ""
 
@@ -2913,7 +2914,7 @@ class SettingsPanel(tk.Frame):
             ("内网代理地址", "proxy_url",
              "默认: https://mcenter.huaqin.com  (留空使用默认值)"),
             ("App ID",       "app_id",
-             "默认: cli_a96ac38049f8d0e5"),
+             f"默认: {FeishuAPIClient.DEFAULT_APP_ID}"),
             ("User ID",      "user_id",
              "企业内网用户 ID（工号）"),
             ("Access Token", "access_token",
@@ -2960,7 +2961,7 @@ class SettingsPanel(tk.Frame):
     def _load_config(self):
         cfg = self.cache.load_api_config()
         self._vars["proxy_url"].set(    cfg.get("proxy_url",     ""))
-        self._vars["app_id"].set(       cfg.get("app_id",        ""))
+        self._vars["app_id"].set(       cfg.get("app_id",        FeishuAPIClient.DEFAULT_APP_ID))
         self._vars["user_id"].set(      cfg.get("user_id",       ""))
         self._vars["access_token"].set( cfg.get("access_token",  ""))
         self._apply_to_api()
@@ -2972,14 +2973,14 @@ class SettingsPanel(tk.Frame):
 
     def _reset_defaults(self):
         self._vars["proxy_url"].set("")
-        self._vars["app_id"].set("")
+        self._vars["app_id"].set(FeishuAPIClient.DEFAULT_APP_ID)
         self._vars["user_id"].set("")
         self._vars["access_token"].set("")
         self._apply_to_api()
 
     def _apply_to_api(self):
         self.api.base_url      = self._vars["proxy_url"].get()    or FeishuAPIClient.DEFAULT_PROXY
-        self.api.app_id        = self._vars["app_id"].get()       or "cli_a96ac38049f8d0e5"
+        self.api.app_id        = self._vars["app_id"].get()       or FeishuAPIClient.DEFAULT_APP_ID
         self.api.user_id       = self._vars["user_id"].get()
         self.api.access_token  = self._vars["access_token"].get()
 
@@ -3089,7 +3090,7 @@ class FeishuFormulaApp(tk.Tk):
         cfg = self.cache.load_api_config()
         if cfg:
             self.api.base_url     = cfg.get("proxy_url",    "") or FeishuAPIClient.DEFAULT_PROXY
-            self.api.app_id       = cfg.get("app_id",       "") or "cli_a96ac38049f8d0e5"
+            self.api.app_id       = cfg.get("app_id",       "") or FeishuAPIClient.DEFAULT_APP_ID
             self.api.user_id      = cfg.get("user_id",      "")
             self.api.access_token = cfg.get("access_token", "")
 
