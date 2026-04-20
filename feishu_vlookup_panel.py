@@ -98,32 +98,37 @@ class FeishuAPIClient:
 
     # ── 内网代理模式 ──────────────────────────────────────────────────────────
 
-    def _proxy_headers(self) -> dict:
-        return {
-            "Content-Type": "application/json",
-            "Origin":       self.app_id,
-            "userId":       self.user_id,
-        }
-
     def get_sheet_meta_proxy(self, token: str) -> dict:
-        url  = f"{self.base_url}/fs/sheet/v1/spreadsheetsMetainfo"
-        body = {"spreadsheetToken": token}
-        r = requests.post(url, json=body, headers=self._proxy_headers(), timeout=30)
+        url    = f"{self.base_url}/fs/sheet/v1/spreadsheetsMetainfo"
+        params = {
+            "origin":            self.app_id,
+            "userId":            self.user_id,
+            "spreadsheetToken":  token,
+        }
+        r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        if data.get("code") not in (0, 200):
+            raise RuntimeError(f"获取表格元信息失败：{data.get('msg')}（code={data.get('code')}）")
+        return data
 
     def get_sheet_values_proxy(self, token: str, sheet_id: str,
-                               start_row: int = 1, end_row: int = 2000) -> dict:
-        url  = f"{self.base_url}/fs/sheet/v1/getSheetsValue"
-        body = {
+                               start_row: int = 1, end_row: int = 5000) -> dict:
+        safe_rows = min(max(end_row, 100), 10000)
+        range_str = f"{sheet_id}!A1:Z{safe_rows}"
+        url    = f"{self.base_url}/fs/sheet/v1/getSheetsValue"
+        params = {
+            "origin":           self.app_id,
+            "userId":           self.user_id,
             "spreadsheetToken": token,
-            "sheetId":          sheet_id,
-            "startRow":         start_row,
-            "endRow":           end_row,
+            "range":            range_str,
         }
-        r = requests.post(url, json=body, headers=self._proxy_headers(), timeout=60)
+        r = requests.get(url, params=params, timeout=60)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        if data.get("code") not in (0, 200):
+            raise RuntimeError(f"读取表格数据失败：{data.get('msg')}（code={data.get('code')}）")
+        return data
 
     # ── 官方 Open API 模式 ────────────────────────────────────────────────────
 
@@ -182,9 +187,10 @@ class FeishuAPIClient:
             value_range = inner.get("valueRange") or {}
             return value_range.get("values") or []
         else:
-            data  = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows) or {}
-            inner = data.get("data") or {}
-            return inner.get("values") or []
+            data        = self.get_sheet_values_proxy(token, sheet_id, 1, max_rows) or {}
+            inner       = data.get("data") or {}
+            value_range = inner.get("valueRange") or {}
+            return value_range.get("values") or []
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
